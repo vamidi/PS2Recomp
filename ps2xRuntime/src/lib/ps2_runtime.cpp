@@ -1439,6 +1439,19 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
+    // TOL_TRACE_DISPATCH=1: log the first transfers with their $ra, because a return to pc 0 is exactly
+    // "jr with ra == 0" and the chain says which call introduced it.
+    {
+        static uint32_t sDispatchLogs = 0u;
+        if (sDispatchLogs < 45u && std::getenv("TOL_TRACE_DISPATCH") != nullptr)
+        {
+            ++sDispatchLogs;
+            std::cerr << "[dispatch] kind=" << static_cast<int>(kind) << " target=0x" << std::hex << targetPc
+                      << " src=0x" << sourcePc << " ra=0x" << getRegU32(ctx, 31) << std::dec << " name="
+                      << (debugName ? debugName : "?") << std::endl;
+        }
+    }
+
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
@@ -1564,7 +1577,31 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
                                    ? encodedSyscallId
                                    : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
 
-    if (ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this))
+    // TOL_TRACE_SYSCALL=1: log the first calls with their arguments and return value, flagging error returns.
+    // This is what names the call that makes an init routine give up and return.
+    const bool traceSyscall = std::getenv("TOL_TRACE_SYSCALL") != nullptr;
+    const uint32_t syscallA0 = traceSyscall ? getRegU32(ctx, 4) : 0u;
+    const uint32_t syscallA1 = traceSyscall ? getRegU32(ctx, 5) : 0u;
+    const uint32_t syscallA2 = traceSyscall ? getRegU32(ctx, 6) : 0u;
+    const uint32_t syscallA3 = traceSyscall ? getRegU32(ctx, 7) : 0u;
+
+    const bool syscallHandled = ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this);
+
+    if (traceSyscall)
+    {
+        static uint32_t sSyscallLogs = 0u;
+        if (sSyscallLogs < 150u)
+        {
+            ++sSyscallLogs;
+            const int32_t returnValue = static_cast<int32_t>(getRegU32(ctx, 2));
+            std::cerr << "[syscall] 0x" << std::hex << syscallId << " a0=0x" << syscallA0 << " a1=0x" << syscallA1
+                      << " a2=0x" << syscallA2 << " a3=0x" << syscallA3 << " -> v0=0x"
+                      << static_cast<uint32_t>(returnValue) << std::dec
+                      << (returnValue < 0 ? " ERROR" : "") << " handled=" << (syscallHandled ? 1 : 0) << std::endl;
+        }
+    }
+
+    if (syscallHandled)
     {
         return;
     }

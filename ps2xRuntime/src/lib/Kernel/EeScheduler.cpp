@@ -356,13 +356,27 @@ void EeScheduler::run()
         // TOL_TRACE_PARK=1: a generated function returned into pc 0 (a jr ra with ra == 0). The dispatch that
         // produced it is the last non-zero pc this loop saw; that names the function that bailed.
         static uint32_t sPs2LastNonZeroPc = 0u;
+        // Keep the last few dispatch targets: a park is usually the tail of a short chain, and the chain is what
+        // says whether the guest took a computed jump or simply returned from where it was called.
+        static uint32_t sPs2RecentPcs[16] = {};
+        static uint32_t sPs2RecentCount = 0u;
         if (context.pc == 0u)
         {
             if (std::getenv("TOL_TRACE_PARK") != nullptr)
-                std::cerr << "[ee-park] thread=" << running->id << " returned-to-pc0 from=0x" << std::hex
-                          << sPs2LastNonZeroPc << " ra=0x" << getRegU32(&context, 31) << " sp=0x"
+            {
+                std::cerr << "[ee-park] thread=" << running->id << " entry=0x" << std::hex << running->entry
+                          << " returned-to-pc0 from=0x" << sPs2LastNonZeroPc
+                          << " ra=0x" << getRegU32(&context, 31) << " sp=0x"
                           << getRegU32(&context, 29) << std::dec
-                          << " invocations=" << running->invocations.size() << std::endl;
+                          << " invocations=" << running->invocations.size() << " recent=";
+                const uint32_t shown = std::min<uint32_t>(sPs2RecentCount, 16u);
+                for (uint32_t i = 0u; i < shown; ++i)
+                {
+                    const uint32_t index = (sPs2RecentCount - 1u - i) & 15u;
+                    std::cerr << "0x" << std::hex << sPs2RecentPcs[index] << (i + 1u == shown ? "" : ", ");
+                }
+                std::cerr << std::dec << std::endl;
+            }
             if (!running->invocations.empty())
             {
                 GuestInvocation completed = std::move(running->invocations.back());
@@ -385,6 +399,8 @@ void EeScheduler::run()
         }
 
         sPs2LastNonZeroPc = context.pc;
+        sPs2RecentPcs[sPs2RecentCount & 15u] = context.pc;
+        ++sPs2RecentCount;
 
         // Invocations nest onto the running thread, so a callback storm stacks
         // them faster than they retire -- DQ8's movie streaming reached depth 13
