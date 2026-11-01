@@ -250,6 +250,32 @@ namespace ps2_syscalls
         setReturnS32(ctx, 0);
     }
 
+    void GetRomName(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        uint32_t bufAddr = getRegU32(ctx, 4); // $a0
+        size_t bufSize = getRegU32(ctx, 5);   // $a1
+        char *hostBuf = reinterpret_cast<char *>(getMemPtr(rdram, bufAddr));
+        const char *romName = "ROMVER 0100";
+
+        if (!hostBuf)
+        {
+            std::cerr << "GetRomName error: Invalid buffer address" << std::endl;
+            setReturnS32(ctx, -1); // Error
+            return;
+        }
+        if (bufSize == 0)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+
+        strncpy(hostBuf, romName, bufSize - 1);
+        hostBuf[bufSize - 1] = '\0';
+
+        // returns the length of the string (excluding null?) or error
+        setReturnS32(ctx, (int32_t)strlen(hostBuf));
+    }
+
     void SifLoadElfPart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t pathAddr = getRegU32(ctx, 4);     // $a0 - path
@@ -287,40 +313,33 @@ namespace ps2_syscalls
 
     void sceSifLoadModuleBuffer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t bufferAddr = getRegU32(ctx, 4);   // $a0
-        const uint32_t argumentSize = getRegU32(ctx, 5); // $a1
-        const uint32_t argumentAddr = getRegU32(ctx, 6); // $a2
+        const uint32_t bufferAddr = getRegU32(ctx, 4); // $a0
         if (!rdram || bufferAddr == 0u)
         {
             setReturnS32(ctx, -1);
             return;
         }
 
+        // Match buffer-based module loads to stable synthetic tags so module ID lookup remains deterministic.
         const std::string moduleTag = makeSifModuleBufferTag(rdram, bufferAddr);
-        std::vector<uint8_t> arguments;
-        constexpr uint32_t kMaxIopModuleArguments = 64u * 1024u;
-        if (!copyGuestBytesBounded(rdram, argumentAddr, argumentSize, kMaxIopModuleArguments, arguments))
+        const int32_t moduleId = trackSifModuleLoad(moduleTag);
+        if (moduleId <= 0)
         {
             setReturnS32(ctx, -1);
             return;
         }
 
-        if (!runtime)
+        uint32_t refs = 0;
         {
-            setReturnS32(ctx, -1);
-            return;
+            std::lock_guard<std::mutex> lock(g_sif_module_mutex);
+            auto it = g_sif_modules_by_id.find(moduleId);
+            if (it != g_sif_modules_by_id.end())
+            {
+                refs = it->second.refCount;
+            }
         }
-
-        const auto loaded = runtime->loadIopModuleBuffer(bufferAddr, arguments.empty() ? nullptr : arguments.data(), static_cast<uint32_t>(arguments.size()));
-        if (!loaded.handled || loaded.moduleId <= 0)
-        {
-            setReturnS32(ctx, -1);
-            return;
-        }
-
-        trackSifModuleLoadExternal(moduleTag, loaded.moduleId);
-        logSifModuleAction("load-buffer-emulated", loaded.moduleId, moduleTag, 1u);
-        setReturnS32(ctx, loaded.moduleId);
+        logSifModuleAction("load-buffer", moduleId, moduleTag, refs);
+        setReturnS32(ctx, moduleId);
     }
 
     void TODO(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t encodedSyscallId)
@@ -491,22 +510,15 @@ namespace ps2_syscalls
                                        : 0u;
         if (stack == 0xFFFFFFFFu)
         {
-            if (stackSizeSigned > 0)
+            if (stackSizeSigned > 0 && static_cast<uint32_t>(stackSizeSigned) < PS2_RAM_SIZE)
             {
-                const uint32_t requestedSize = static_cast<uint32_t>(stackSizeSigned);
-                if (requestedSize < PS2_RAM_SIZE)
-                {
-                    sp = PS2_RAM_SIZE - requestedSize;
-                }
-                else
-                {
-                    sp = PS2_RAM_SIZE;
-                }
+                initialStack = PS2_RAM_SIZE - static_cast<uint32_t>(stackSizeSigned);
             }
             else
             {
-                sp = PS2_RAM_SIZE;
+                initialStack = PS2_RAM_SIZE;
             }
+            sp = initialStack;
         }
         else if (stack != 0u)
         {
@@ -523,7 +535,7 @@ namespace ps2_syscalls
         sp &= ~0xFu;
         if (stack == 0xFFFFFFFFu)
         {
-            initialStack = sp;
+            initialStack &= ~0xFu;
         }
         else if (stack != 0u)
         {
@@ -531,6 +543,16 @@ namespace ps2_syscalls
         }
 
         scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
+        // Frames grow down from the top of the area, as on the kernel, once the
+        // invocation stacks are carved under it: starting at its bottom ran
+        // DQ8's main thread over the ones its VBlank handlers and movie
+        // callbacks were using. When the guest heap limit or the loaded image
+        // leaves no room under the area, the pool stays inside it, and frames
+        // starting at its bottom, as before, still keep out of the pool.
+        if (stack == 0xFFFFFFFFu && runtime->asyncCallbackStackTop() <= initialStack)
+        {
+            sp = PS2_RAM_SIZE;
+        }
         setReturnU32(ctx, sp);
     }
 
@@ -559,6 +581,14 @@ namespace ps2_syscalls
 
         if (runtime)
         {
+            // A guest running its own allocator is describing *its* heap;
+            // moving the runtime arena there would collide with it.
+            if (runtime->guestHeapCeiling() != 0u)
+            {
+                setReturnU32(ctx, heapBase);
+                return;
+            }
+
             runtime->configureGuestHeap(heapBase, heapLimit);
 
             PS2_IF_AGRESSIVE_LOGS({
@@ -585,9 +615,13 @@ namespace ps2_syscalls
 
         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
 
-        const uint32_t ret = runtime
-                                 ? runtime->guestHeapLimit()
-                                 : kDefaultGuestHeapEnd;
+        // A guest running its own allocator grows right up to this value.
+        uint32_t ret = kDefaultGuestHeapEnd;
+        if (runtime)
+        {
+            const uint32_t ceiling = runtime->guestHeapCeiling();
+            ret = (ceiling != 0u) ? ceiling : runtime->guestHeapLimit();
+        }
 
         setReturnU32(ctx, ret);
     }

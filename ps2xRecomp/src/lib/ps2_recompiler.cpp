@@ -102,10 +102,10 @@ namespace ps2recomp
         void writeCombinedOutputPreamble(std::ostream &output)
         {
             output << "#include <stdexcept>\n";
-            output << "#include <ps2_recompiled_functions.h>\n\n";
+            output << "#include \"ps2_recompiled_functions.h\"\n\n";
             output << "#include \"ps2_runtime_macros.h\"\n";
             output << "#include \"ps2_runtime.h\"\n";
-            output << "#include <ps2_recompiled_stubs.h>\n";
+            output << "#include \"ps2_recompiled_stubs.h\"\n";
             output << "#include \"ps2_syscalls.h\"\n";
             output << "#include \"ps2_stubs.h\"\n";
             output << "#ifdef _DEBUG\n";
@@ -288,8 +288,7 @@ namespace ps2recomp
             std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions,
             const std::vector<Section> &sections,
             CodeGenerator *codeGenerator,
-            const std::function<bool(Function &)> &decodeExternalFunction,
-            const std::unordered_set<uint32_t> &seedEntryAddresses = {})
+            const std::function<bool(Function &)> &decodeExternalFunction)
         {
             std::unordered_set<uint32_t> existingStarts;
             for (const auto &function : functions)
@@ -311,19 +310,6 @@ namespace ps2recomp
                     }
                 }
                 return false;
-            };
-
-            auto executableSectionEnd = [&](uint32_t address) -> std::optional<uint32_t>
-            {
-                for (const auto &section : sections)
-                {
-                    if (!section.isCode || address < section.address || address >= section.address + section.size)
-                    {
-                        continue;
-                    }
-                    return section.address + section.size;
-                }
-                return std::nullopt;
             };
 
             auto isSimpleReturnThunkStart = [](const Instruction &inst) -> bool
@@ -410,14 +396,6 @@ namespace ps2recomp
                     pendingEntries.push_back(pending);
                     pendingStarts.insert(target);
                 };
-
-                if (stats.passCount == 1u)
-                {
-                    for (uint32_t target : seedEntryAddresses)
-                    {
-                        queuePendingEntry(target);
-                    }
-                }
 
                 for (const auto &function : functions)
                 {
@@ -556,24 +534,13 @@ namespace ps2recomp
                     }
                     else
                     {
-                        const auto sectionEndOpt = executableSectionEnd(target);
-                        if (!sectionEndOpt.has_value())
-                        {
-                            continue;
-                        }
-
-                        uint32_t entryEnd = sectionEndOpt.value();
                         auto nextStartOpt = findNextBoundaryStart(target);
-                        if (nextStartOpt.has_value() && nextStartOpt.value() < entryEnd)
-                        {
-                            entryEnd = nextStartOpt.value();
-                        }
-                        if (entryEnd <= target)
+                        if (!nextStartOpt.has_value() || nextStartOpt.value() <= target)
                         {
                             continue;
                         }
 
-                        entryFunction.end = entryEnd;
+                        entryFunction.end = nextStartOpt.value();
                         if (!decodeExternalFunction(entryFunction))
                         {
                             continue;
@@ -758,71 +725,6 @@ namespace ps2recomp
 
             return reslicedCount;
         }
-
-        size_t collectInternalEntryTargetsImpl(
-            const std::vector<Function> &functions,
-            const std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions,
-            const std::unordered_set<uint32_t> &entryAddresses,
-            std::unordered_map<uint32_t, std::vector<uint32_t>> &targetsByOwner)
-        {
-            std::unordered_set<uint32_t> functionStarts;
-            functionStarts.reserve(functions.size());
-            for (const auto &function : functions)
-            {
-                functionStarts.insert(function.start);
-            }
-
-            size_t addedCount = 0u;
-            for (uint32_t entryAddress : entryAddresses)
-            {
-                if (functionStarts.contains(entryAddress))
-                {
-                    continue;
-                }
-
-                const Function *owner = nullptr;
-                for (const auto &function : functions)
-                {
-                    if (!function.isRecompiled || function.isStub || function.isSkipped ||
-                        entryAddress <= function.start || entryAddress >= function.end)
-                    {
-                        continue;
-                    }
-
-                    const auto decodedIt = decodedFunctions.find(function.start);
-                    if (decodedIt == decodedFunctions.end())
-                    {
-                        continue;
-                    }
-
-                    const bool containsInstruction = std::any_of(decodedIt->second.begin(), decodedIt->second.end(), [entryAddress](const Instruction &instruction)
-                                                                 { return instruction.address == entryAddress; });
-                    if (!containsInstruction)
-                    {
-                        continue;
-                    }
-
-                    if (!owner || function.start > owner->start)
-                    {
-                        owner = &function;
-                    }
-                }
-
-                if (!owner)
-                {
-                    continue;
-                }
-
-                auto &targets = targetsByOwner[owner->start];
-                if (std::find(targets.begin(), targets.end(), entryAddress) == targets.end())
-                {
-                    targets.push_back(entryAddress);
-                    ++addedCount;
-                }
-            }
-
-            return addedCount;
-        }
     }
 
     PS2Recompiler::PS2Recompiler(const std::string &configPath)
@@ -849,7 +751,6 @@ namespace ps2recomp
             m_stubFunctions.clear();
             m_stubFunctionStarts.clear();
             m_stubHandlerBindingsByStart.clear();
-            m_entryPointHintStarts.clear();
             m_correctnessCriticalFunctionStarts.clear();
 
             for (const auto &name : m_config.skipFunctions)
@@ -889,14 +790,6 @@ namespace ps2recomp
                         }
                         m_stubHandlerBindingsByStart[*selector.start] = selector.name;
                     }
-                }
-            }
-            for (const auto &hint : m_config.entryPointHints)
-            {
-                const FunctionSelector selector = parseFunctionSelector(hint);
-                if (selector.start.has_value())
-                {
-                    m_entryPointHintStarts.insert(*selector.start);
                 }
             }
 
@@ -1090,7 +983,7 @@ namespace ps2recomp
 
                 if (isStubFunction(function))
                 {
-                    if (hasResolvedStubHandler(function))
+                    if (!correctnessCritical || hasResolvedStubHandler(function))
                     {
                         function.isStub = true;
                         function.isSkipped = false;
@@ -1098,15 +991,12 @@ namespace ps2recomp
                         continue;
                     }
 
-                    if (correctnessCritical)
-                    {
-                        m_reporter.recordCorrectnessCriticalGuestFallback();
-                    }
+                    m_reporter.recordCorrectnessCriticalGuestFallback();
                     m_reporter.warningAt(
-                        "stub",
+                        "correctness-critical",
                         function.name,
                         function.start,
-                        "Configured stub has no runtime handler; recompiling the original guest function");
+                        "Unresolved initializer stub ignored; recompiling the original guest function");
                 }
 
                 if (shouldSkipFunction(function))
@@ -1902,63 +1792,6 @@ namespace ps2recomp
             return;
         }
 
-        std::unordered_set<uint32_t> guestFallbackEntryAddresses = m_entryPointHintStarts;
-        for (uint32_t address : m_stubFunctionStarts)
-        {
-            const auto bindingIt = m_stubHandlerBindingsByStart.find(address);
-            if (bindingIt == m_stubHandlerBindingsByStart.end() ||
-                resolveStubTarget(bindingIt->second) == StubTarget::Unknown)
-            {
-                guestFallbackEntryAddresses.insert(address);
-            }
-        }
-
-        // Prefer the existing wrapper when a configured entry lies inside a
-        // decoded function. If Ghidra/analyzer omitted the whole routine,
-        // synthesize a standalone guest function bounded by the next known
-        // function instead of leaving a valid executable target unregistered.
-        collectInternalEntryTargetsImpl(m_functions, m_decodedFunctions, guestFallbackEntryAddresses, m_resumeEntryTargetsByOwner);
-
-        std::unordered_set<uint32_t> coveredEntryAddresses;
-        coveredEntryAddresses.reserve(m_functions.size() + guestFallbackEntryAddresses.size());
-        for (const auto &function : m_functions)
-        {
-            coveredEntryAddresses.insert(function.start);
-        }
-        for (const auto &[owner, targets] : m_resumeEntryTargetsByOwner)
-        {
-            coveredEntryAddresses.insert(targets.begin(), targets.end());
-        }
-
-        std::unordered_set<uint32_t> standaloneEntryAddresses;
-        for (uint32_t address : guestFallbackEntryAddresses)
-        {
-            if (!coveredEntryAddresses.contains(address))
-            {
-                standaloneEntryAddresses.insert(address);
-            }
-        }
-
-        if (!standaloneEntryAddresses.empty())
-        {
-            const EntryDiscoveryStats configuredStats = discoverAdditionalEntryPointsImpl(
-                m_functions,
-                m_decodedFunctions,
-                m_sections,
-                nullptr,
-                [this](Function &function)
-                { return decodeFunction(function); },
-                standaloneEntryAddresses);
-            if (configuredStats.discoveredCount > 0u)
-            {
-                m_reporter.recordAdditionalEntryPoints(configuredStats.discoveredCount);
-                std::ostringstream msg;
-                msg << "synthesized " << configuredStats.discoveredCount
-                    << " standalone configured guest entry point(s)";
-                m_reporter.progress(msg.str());
-            }
-        }
-
         auto findContainingFunction = [&](uint32_t address) -> const Function *
         {
             const Function *best = nullptr;
@@ -2002,38 +1835,6 @@ namespace ps2recomp
             return best;
         };
 
-        // Ghidra exports standalone code blocks (static initializers, thunks, ...) as entry_* labels. Only entry_*
-        // blocks nested inside a real function are synthetic wrappers; standalone ones need their own resume
-        // points, otherwise a thread switched out inside a call from them cannot be resumed.
-        std::vector<std::pair<uint32_t, uint32_t>> ownerRanges;
-        for (const auto &function : m_functions)
-        {
-            if (function.isRecompiled && !function.isStub && !function.isSkipped &&
-                !isEntryFunctionName(function.name) && function.end > function.start)
-            {
-                ownerRanges.emplace_back(function.start, function.end);
-            }
-        }
-        std::sort(ownerRanges.begin(), ownerRanges.end());
-        uint32_t maxEnd = 0u;
-        std::vector<uint32_t> prefixMaxEnd;
-        prefixMaxEnd.reserve(ownerRanges.size());
-        for (const auto &range : ownerRanges)
-        {
-            maxEnd = std::max(maxEnd, range.second);
-            prefixMaxEnd.push_back(maxEnd);
-        }
-        auto nestedInRealFunction = [&](uint32_t address) -> bool
-        {
-            auto it = std::upper_bound(ownerRanges.begin(), ownerRanges.end(), std::make_pair(address, UINT32_MAX));
-            if (it == ownerRanges.begin())
-            {
-                return false;
-            }
-            const size_t idx = static_cast<size_t>(std::distance(ownerRanges.begin(), it)) - 1u;
-            return prefixMaxEnd[idx] > address;
-        };
-
         for (const auto &function : m_functions)
         {
             if (!function.isRecompiled || function.isStub || function.isSkipped)
@@ -2041,7 +1842,7 @@ namespace ps2recomp
                 continue;
             }
 
-            if (isEntryFunctionName(function.name) && nestedInRealFunction(function.start))
+            if (isEntryFunctionName(function.name))
             {
                 continue;
             }
@@ -2119,6 +1920,9 @@ namespace ps2recomp
 
         uint32_t start = function.start;
         uint32_t end = function.end;
+        // A branch at the mapped end still owns the next word as its delay
+        // slot; without this the emitter substitutes a NOP and loses it.
+        bool delaySlotExtended = false;
 
         for (uint32_t address = start; address < end; address += 4)
         {
@@ -2176,6 +1980,12 @@ namespace ps2recomp
                 }
 
                 instructions.push_back(inst);
+
+                if (!delaySlotExtended && inst.hasDelaySlot && address + 4u == end)
+                {
+                    delaySlotExtended = true;
+                    end += 4u;
+                }
             }
             catch (const std::exception &e)
             {
@@ -2351,12 +2161,12 @@ namespace ps2recomp
         return outputPath;
     }
 
-    std::string PS2Recompiler::clampFilenameLength(const std::string &baseName, const std::string &extension, std::size_t maxLength)
+    std::string PS2Recompiler::clampFilenameLength(const std::string& baseName, const std::string& extension, std::size_t maxLength)
     {
         if (maxLength == 0)
         {
             // Keep this static helper side-effect free; callers validate arguments.
-            // Better go over the limit than create files with an empty path
+            //Better go over the limit than create files with an empty path
             return baseName + extension;
         }
 
@@ -2423,18 +2233,11 @@ namespace ps2recomp
         return stats.discoveredCount;
     }
 
-    size_t PS2Recompiler::ResliceEntryFunctions(std::vector<Function> &functions, std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions)
+    size_t PS2Recompiler::ResliceEntryFunctions(
+        std::vector<Function> &functions,
+        std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions)
     {
         return resliceEntryFunctionsImpl(functions, decodedFunctions);
-    }
-
-    size_t PS2Recompiler::CollectInternalEntryTargets(
-        const std::vector<Function> &functions,
-        const std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions,
-        const std::unordered_set<uint32_t> &entryAddresses,
-        std::unordered_map<uint32_t, std::vector<uint32_t>> &targetsByOwner)
-    {
-        return collectInternalEntryTargetsImpl(functions, decodedFunctions, entryAddresses, targetsByOwner);
     }
 
     StubTarget PS2Recompiler::resolveStubTarget(const std::string &name)
@@ -2450,7 +2253,7 @@ namespace ps2recomp
         return StubTarget::Unknown;
     }
 
-    std::string PS2Recompiler::ClampFilenameLength(const std::string &baseName, const std::string &extension, std::size_t maxLength)
+    std::string PS2Recompiler::ClampFilenameLength(const std::string& baseName, const std::string& extension, std::size_t maxLength)
     {
         return clampFilenameLength(baseName, extension, maxLength);
     }

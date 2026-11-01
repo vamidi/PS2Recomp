@@ -220,44 +220,44 @@ namespace GSMem
         PixelStorageTraits<P4>::InitPageLookupTable(PageTableP4, BlockTableP4, ColumnTable4);
     }
 
-    u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y)
-    {
-        switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
-        {
-        case C32:
-            return PixelStorageTraits<C32>::Read(PageTableC32, data, bp, bw, x, y, &cache);
-        case C24:
-            return PixelStorageTraits<C24>::Read(PageTableC32, data, bp, bw, x, y, &cache);
-        case C16:
-            return PixelStorageTraits<C16>::Read(PageTableC16, data, bp, bw, x, y, &cache);
-        case C16S:
-            return PixelStorageTraits<C16S>::Read(PageTableC16S, data, bp, bw, x, y, &cache);
-        case P8:
-            return PixelStorageTraits<P8>::Read(PageTableP8, data, bp, bw, x, y, &cache);
-        case P4:
-            return PixelStorageTraits<P4>::Read(PageTableP4, data, bp, bw, x, y, &cache);
-        case P8H:
-            return PixelStorageTraits<P8H>::Read(PageTableC32, data, bp, bw, x, y, &cache);
-        case P4HL:
-            return PixelStorageTraits<P4HL>::Read(PageTableC32, data, bp, bw, x, y, &cache);
-        case P4HH:
-            return PixelStorageTraits<P4HH>::Read(PageTableC32, data, bp, bw, x, y, &cache);
-        case Z32:
-            return PixelStorageTraits<Z32>::Read(PageTableZ32, data, bp, bw, x, y, &cache);
-        case Z24:
-            return PixelStorageTraits<Z24>::Read(PageTableZ32, data, bp, bw, x, y, &cache);
-        case Z16:
-            return PixelStorageTraits<Z16>::Read(PageTableZ16, data, bp, bw, x, y, &cache);
-        case Z16S:
-            return PixelStorageTraits<Z16S>::Read(PageTableZ16S, data, bp, bw, x, y, &cache);
-        default:
-            return 0u;
-        }
-    }
-
     void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)
     {
         PixelStorageTraits<C32>::Write(PageTableC32, data, bp, bw, x, y, value);
+    }
+
+    namespace
+    {
+        // Shared body for the 32-bit run writers. Defined here so the storage
+        // traits and their page table inline into the loop.
+        template <PixelStorageMode psm, typename TableT>
+        inline void WriteRun32(const TableT& table, u8* data, u32 bp, u32 bw, u32 dsax,
+                               u32 rowEnd, u32 x, u32 y, const u8* src, u32 count)
+        {
+            for (u32 i = 0; i < count; ++i)
+            {
+                u32 value = 0;
+                std::memcpy(&value, src, sizeof(value));
+                src += sizeof(value);
+                PixelStorageTraits<psm>::Write(table, data, bp, bw, x, y, value);
+                if (++x >= rowEnd)
+                {
+                    x = dsax;
+                    ++y;
+                }
+            }
+        }
+    }
+
+    void WriteRunCT32(u8* data, u32 bp, u32 bw, u32 dsax, u32 rowEnd, u32 x, u32 y,
+                      const u8* src, u32 count)
+    {
+        WriteRun32<C32>(PageTableC32, data, bp, bw, dsax, rowEnd, x, y, src, count);
+    }
+
+    void WriteRunZ32(u8* data, u32 bp, u32 bw, u32 dsax, u32 rowEnd, u32 x, u32 y,
+                     const u8* src, u32 count)
+    {
+        WriteRun32<Z32>(PageTableZ32, data, bp, bw, dsax, rowEnd, x, y, src, count);
     }
 
     void WriteCT24(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)
@@ -392,6 +392,66 @@ namespace GSMem
     u32 ReadNull(u8* data, u32 bp, u32 bw, u32 x, u32 y)
     {
         return 0;
+    }
+
+    namespace
+    {
+        // Body for the consecutive-x row readers. Along a row only the
+        // in-page column and the page column move, so the walk is increments;
+        // the swizzle table lookup is the only per-pixel work left. The
+        // address mask matches Read()'s wrap guard for regions past 4 MiB.
+        template <typename TableT, u32 PageW, u32 PageH, u32 BytesPerPixel>
+        inline void ReadRowImpl(const TableT& table, u8* data, u32 bp, u32 bw,
+                                u32 x, u32 y, u32 count, u8* dst)
+        {
+            constexpr u32 kBlocksPerPage = 32;
+            constexpr u32 kPixelsPerPage = PageW * PageH;
+            constexpr u32 kAddressMask = u32(MEMORY_SIZE) - BytesPerPixel;
+
+            const u32 basePage = bp / kBlocksPerPage;
+            const u32 block = bp % kBlocksPerPage;
+            const u32 pagesPerRow = (bw * 64u) / PageW;
+            const u32 pageRowBase = basePage + (y / PageH) * pagesPerRow;
+            const u32 yInPage = y % PageH;
+            const auto& row = table[block][yInPage];
+
+            u32 page = pageRowBase + x / PageW;
+            u32 xInPage = x % PageW;
+            while (count > 0)
+            {
+                const u32 segment = count < (PageW - xInPage) ? count : (PageW - xInPage);
+                const u32 pageAddress = page * kPixelsPerPage;
+                for (u32 i = 0; i < segment; ++i)
+                {
+                    const u32 byteAddress =
+                        ((pageAddress + row[xInPage + i]) * BytesPerPixel) & kAddressMask;
+                    std::memcpy(dst, data + byteAddress, BytesPerPixel);
+                    dst += BytesPerPixel;
+                }
+                xInPage += segment;
+                if (xInPage == PageW)
+                {
+                    xInPage = 0;
+                    ++page;
+                }
+                count -= segment;
+            }
+        }
+    }
+
+    void ReadRowCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 count, u8* dst)
+    {
+        ReadRowImpl<C32PageLookupTable, 64, 32, 4>(PageTableC32, data, bp, bw, x, y, count, dst);
+    }
+
+    void ReadRowZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 count, u8* dst)
+    {
+        ReadRowImpl<Z32PageLookupTableT, 64, 32, 4>(PageTableZ32, data, bp, bw, x, y, count, dst);
+    }
+
+    void ReadRowP8(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 count, u8* dst)
+    {
+        ReadRowImpl<P8PageLookupTable, 128, 64, 1>(PageTableP8, data, bp, bw, x, y, count, dst);
     }
 }
 

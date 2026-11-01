@@ -7,12 +7,11 @@
 #include <span>
 
 #include "types.h"
-#include "runtime/gs/gs_texture_page_cache.h"
 
 namespace GSMem
 {
 	constexpr usz MEMORY_SIZE = 4_mb;
-	constexpr usz GS_PAGE_SIZE = TexturePageCache::kPageSize;
+	constexpr usz GS_PAGE_SIZE = 8_kb;
 
 	// these are all the same regardless of storage mode
 	constexpr usz BLOCKS_PER_PAGE = 32;
@@ -262,7 +261,7 @@ namespace GSMem
 		static constexpr void Write(const PageLookupTableT& table, u8* data, u32 block, u32 bw, u32 x, u32 y, PackedT value);
 
 		// reads the pixel
-		static constexpr auto Read(const PageLookupTableT& table, const u8* data, u32 block, u32 bw, u32 x, u32 y, TexturePageCache* cache = nullptr) -> PackedT;
+		static constexpr auto Read(const PageLookupTableT& table, u8* data, u32 block, u32 bw, u32 x, u32 y) -> PackedT;
 
 		static_assert(BlocksPerPage() == BLOCKS_PER_PAGE);
 		static_assert(IsValidPsm(psm));
@@ -502,16 +501,15 @@ namespace GSMem
 	}
 
 	template<PixelStorageMode psm>
-	constexpr auto PixelStorageTraits<psm>::Read(const PageLookupTableT& table, const u8* data, u32 block, u32 bw, u32 x, u32 y, TexturePageCache* cache) -> PackedT
+	constexpr auto PixelStorageTraits<psm>::Read(const PageLookupTableT& table, u8* data, u32 block, u32 bw, u32 x, u32 y) -> PackedT
 	{
 		const u32 pixel_addr = Address(table, block, bw, x, y);
 		const u32 bits = pixel_addr * UnpackedBitWidth(psm) + BitOffset();
 		const u32 byte_addr = (bits / 8) & (MEMORY_SIZE - sizeof(PackedT));
 		const u32 shift = bits % 8;
 
-		const u8* source = cache ? cache->Resolve(data, byte_addr) : data + byte_addr;
 		PackedT v;
-		std::memcpy(&v, source, sizeof(PackedT));
+		std::memcpy(&v, &data[byte_addr], sizeof(PackedT));
 
 		switch (psm)
 		{
@@ -535,16 +533,25 @@ namespace GSMem
 			break;
 		}
 
-		return static_cast<PackedT>(0xFFFF00FFu);
+		return 0xFFFF00FFu;
 	}
 
 	void InitLookupTables();
 
-    // Shares swizzle, VRAM wrapping, and lane extraction with the direct reads.
-    u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y);
-
 	void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 	void WriteZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
+
+	// Writes `count` little-endian 32-bit pixels from `src`, starting at (x, y)
+	// and wrapping back to `dsax` when x reaches `rowEnd`. The per-pixel entry
+	// points above are out-of-line wrappers around a template whose lookup table
+	// is private to ps2_gs_memory.cpp, so a caller writing a run of pixels pays a
+	// cross-TU call each time and nothing inlines. A host-to-local transfer moves
+	// 256 pixels per 16x16 tile and DQ8's movies send ~900 tiles a frame, which
+	// made that the hottest thing in the runtime.
+	void WriteRunCT32(u8* data, u32 bp, u32 bw, u32 dsax, u32 rowEnd, u32 x, u32 y,
+	                  const u8* src, u32 count);
+	void WriteRunZ32(u8* data, u32 bp, u32 bw, u32 dsax, u32 rowEnd, u32 x, u32 y,
+	                 const u8* src, u32 count);
 
 	void WriteCT24(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 	void WriteZ24(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
@@ -585,4 +592,13 @@ namespace GSMem
 	u32 ReadP4HH(u8* data, u32 bp, u32 bw, u32 x, u32 y);
 
 	u32 ReadNull(u8* data, u32 bp, u32 bw, u32 x, u32 y);
+
+	// Reads `count` consecutive-x pixels starting at (x, y) into dst, packed
+	// at the PSM's storage width. Texture expansion reads whole rows; the
+	// per-pixel entry points recompute page, block row and column from (x, y)
+	// with three integer divisions each, and a 512x448 expand paid that 229k
+	// times. Same values, same order, increments instead of divisions.
+	void ReadRowCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 count, u8* dst);
+	void ReadRowZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 count, u8* dst);
+	void ReadRowP8(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 count, u8* dst);
 }

@@ -120,6 +120,7 @@
     X(SetOsdConfigParam2)      \
     X(EnableCache)             \
     X(DisableCache)            \
+    X(GetRomName)              \
     X(SifLoadElfPart)          \
     X(sceSifLoadElf)           \
     X(sceSifLoadElfPart)       \

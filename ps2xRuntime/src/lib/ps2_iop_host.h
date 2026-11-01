@@ -48,10 +48,6 @@ public:
     bool writeGuest(uint32_t address, const void *source, size_t size) override;
     bool zeroGuest(uint32_t address, size_t size) override;
     bool normalizeGuestAddress(uint32_t address, uint32_t &normalized) const override;
-    bool readIopMemory(uint32_t address, void *destination, size_t size) const override;
-    bool writeIopMemory(uint32_t address, const void *source, size_t size) override;
-    bool zeroIopMemory(uint32_t address, size_t size) override;
-    bool normalizeIopAddress(uint32_t address, uint32_t &normalized) const override;
     uint32_t allocateIopHandle(ps2x::iop::IopHandleKind kind) override;
     uint32_t allocateGuest(uint32_t size, uint32_t alignment) override;
     void freeGuest(uint32_t address) override;
@@ -75,6 +71,7 @@ public:
     int32_t memoryCard(const ps2x::iop::MemoryCardRequest &request) override;
 
     bool hasGuestFunction(uint32_t address) const override;
+    bool hasGuestRpcServer(uint32_t sid) const override;
     bool invokeGuestFunction(uint64_t callToken,
                              uint32_t address,
                              uint32_t a0,
@@ -82,7 +79,6 @@ public:
                              uint32_t a2,
                              uint32_t a3,
                              uint32_t *resultAddress) override;
-    bool sendSifCommand(uint32_t commandId, const void *packet, size_t packetSize) override;
 
     void log(ps2x::iop::LogLevel level, std::string_view message) override;
 

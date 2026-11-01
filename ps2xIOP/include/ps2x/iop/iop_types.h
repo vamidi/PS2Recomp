@@ -27,13 +27,6 @@ namespace ps2x::iop
         uint32_t crc32 = 0;
     };
 
-    struct ModuleLoadResult
-    {
-        bool handled = false;
-        int32_t moduleId = -1;
-        int32_t startResult = -1;
-    };
-
     enum class RpcAbi : uint32_t
     {
         RuntimeDefault = 0,
@@ -138,17 +131,14 @@ namespace ps2x::iop
     {
         std::string name;
         std::vector<uint32_t> sids;
-        bool active = true;
+        bool profileSpecific = false;
         std::vector<DebugMetric> metrics;
     };
 
     struct DebugSnapshot
     {
-        uint64_t emulatorCycles = 0;
-        uint64_t emulatorInstructions = 0;
-        uint32_t emulatorLoadedModules = 0;
-        uint32_t emulatorThreads = 0;
-        uint32_t emulatorRpcServers = 0;
+        std::string activeProfile;
+        std::string activeProvider;
         std::vector<DebugService> services;
         std::vector<std::string> diagnostics;
     };

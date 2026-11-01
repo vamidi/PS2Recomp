@@ -1,0 +1,457 @@
+#include "runtime/gs/gs_threaded_backend.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cfenv>
+#include <condition_variable>
+#include <exception>
+#include <mutex>
+#include <stdexcept>
+#include <thread>
+#include <variant>
+
+#include "ThreadNaming.h"
+
+struct GSThreadedBackend::Impl
+{
+    struct PresentationResult
+    {
+        std::mutex mutex;
+        std::condition_variable ready;
+        bool completed = false;
+        GSPresentationTicket frame;
+        std::exception_ptr error;
+        void fail(std::exception_ptr failure)
+        {
+            std::lock_guard lock(mutex);
+            if (completed) return;
+            error = failure;
+            completed = true;
+            ready.notify_all();
+        }
+    };
+    struct PresentationTicket final : GSPreparedPresentation
+    {
+        std::shared_ptr<const int> owner;
+        std::shared_ptr<PresentationResult> result;
+        PresentationTicket(std::shared_ptr<const int> owner, std::shared_ptr<PresentationResult> result)
+            : owner(std::move(owner)), result(std::move(result)) {}
+    };
+    struct Prepare
+    {
+        GSPresentationRequest request;
+        std::shared_ptr<PresentationResult> result;
+    };
+    enum class Op { Submit, Transfer, Upload, Flush, TextureFlush, Write, Prepare };
+    using Pixel = std::array<uint32_t, 6>;
+    struct Command
+    {
+        Op op;
+        std::variant<std::monostate, GSPrimitiveBatch, GSTransferCommand,
+                     std::vector<uint8_t>, Pixel, Prepare> data;
+        int rounding = std::fegetround();
+        size_t bytes() const
+        {
+            return sizeof(Command) + (op == Op::Upload ? std::get<std::vector<uint8_t>>(data).size() : 0u);
+        }
+    };
+
+    explicit Impl(std::unique_ptr<GSRasterBackend> target, size_t queueBytes)
+        : backend(std::move(target)), capacity(std::max(queueBytes, sizeof(Command)))
+    {
+        if (!backend)
+            throw std::invalid_argument("GS worker requires a backend");
+        worker = std::thread([this] { run(); });
+    }
+
+    ~Impl()
+    {
+        backend->CancelPreparedPresentations();
+        {
+            // Whatever is still staged runs before the worker stops.
+            std::lock_guard submitLock(submission);
+            try
+            {
+                publishStaged(false);
+            }
+            catch (...)
+            {
+            }
+        }
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+        }
+        work.notify_one();
+        worker.join();
+    }
+
+    void enqueue(Command command, bool flush = false)
+    {
+        // A presenter may also submit. Holding this lock across a drain keeps
+        // newer commands behind the synchronous operation, not merely its fence.
+        std::lock_guard submitLock(submission);
+        // A failed worker takes nothing more: report it now, as an unbatched
+        // submit would, instead of at the next flush.
+        if (failed.load(std::memory_order_acquire))
+        {
+            std::lock_guard lock(mutex);
+            rethrow();
+        }
+        const size_t size = command.bytes();
+        staged.push_back(std::move(command));
+        stagedBytes += size;
+        // Handed over in groups: per-command locking and wakeups cost more
+        // than the copies. An idle worker gets them at once.
+        if (flush || staged.size() >= kStageCommands ||
+            stagedBytes >= std::min(kStageBytes, capacity) || idle.load(std::memory_order_acquire))
+            publishStaged(flush);
+    }
+
+    // The worker's side of publishStaged, when it is idle: nothing outstanding,
+    // so no capacity to wait for. Caller holds `submission`, not `mutex`.
+    void takeStaged()
+    {
+        if (staged.empty())
+            return;
+        std::lock_guard lock(mutex);
+        pending.reserve(pending.size() + staged.size());
+        for (auto &command : staged)
+            pending.push_back(std::move(command));
+        staged.clear();
+        outstandingBytes += stagedBytes;
+        stagedBytes = 0u;
+    }
+
+    // Caller holds `submission`.
+    void publishStaged(bool flush)
+    {
+        if (staged.empty() && !flush)
+            return;
+        std::unique_lock lock(mutex);
+        if (outstandingBytes != 0u && stagedBytes > capacity - std::min(capacity, outstandingBytes))
+        {
+            urgent = true;
+            work.notify_one();
+            progress.wait(lock, [&] {
+                return error || outstandingBytes == 0u ||
+                       stagedBytes <= capacity - std::min(capacity, outstandingBytes);
+            });
+        }
+        rethrow();
+        if (pending.empty())
+            pending.swap(staged);
+        else
+        {
+            pending.reserve(pending.size() + staged.size());
+            for (auto &command : staged)
+                pending.push_back(std::move(command));
+        }
+        staged.clear();
+        outstandingBytes += stagedBytes;
+        stagedBytes = 0u;
+        urgent = urgent || flush;
+        work.notify_one();
+    }
+
+    template <class F>
+    auto observe(F &&fn)
+    {
+        std::lock_guard submitLock(submission);
+        publishStaged(true);
+        {
+            std::unique_lock lock(mutex);
+            urgent = true;
+            work.notify_one();
+            progress.wait(lock, [&] { return outstandingBytes == 0u || error; });
+            rethrow();
+        }
+        return fn(*backend);
+    }
+
+    void rethrow() const
+    {
+        if (error)
+            std::rethrow_exception(error);
+    }
+
+    void execute(const Command &command)
+    {
+        // XGKICK submits while the VU has selected rounding toward zero.
+        if (rounding != command.rounding)
+        {
+            std::fesetround(command.rounding);
+            rounding = command.rounding;
+        }
+        switch (command.op)
+        {
+        case Op::Submit: backend->Submit(std::get<GSPrimitiveBatch>(command.data)); break;
+        case Op::Transfer: backend->BeginTransfer(std::get<GSTransferCommand>(command.data)); break;
+        case Op::Upload:
+        {
+            const auto &bytes = std::get<std::vector<uint8_t>>(command.data);
+            backend->UploadImage(bytes.data(), static_cast<uint32_t>(bytes.size()));
+            break;
+        }
+        case Op::Flush: backend->Flush(); break;
+        case Op::TextureFlush: backend->TextureFlush(); break;
+        case Op::Write:
+        {
+            const auto &p = std::get<Pixel>(command.data);
+            backend->WriteVram(p[0], p[1], p[2], p[3], p[4], p[5]);
+            break;
+        }
+        case Op::Prepare:
+        {
+            const auto &prepare = std::get<Prepare>(command.data);
+            backend->Flush();
+            backend->Sync(GSSyncReason::Presentation);
+            auto frame = backend->PreparePresentation(prepare.request);
+            if (!frame)
+                throw std::runtime_error("GS presentation preparation returned no ticket");
+            std::lock_guard lock(prepare.result->mutex);
+            prepare.result->frame = std::move(frame);
+            prepare.result->completed = true;
+            prepare.result->ready.notify_all();
+            break;
+        }
+        }
+    }
+
+    void run()
+    {
+        rounding = std::fegetround();
+        ThreadNaming::SetCurrentThreadName("GSWorker");
+        std::vector<Command> batch;
+        std::vector<const GSPrimitiveBatch *> run;
+        for (;;)
+        {
+            size_t bytes = 0u;
+            {
+                std::unique_lock lock(mutex);
+                while (!stopping && pending.empty())
+                {
+                    idle.store(true, std::memory_order_release);
+                    if (work.wait_for(lock, std::chrono::milliseconds(2),
+                                      [&] { return stopping || !pending.empty(); }))
+                        break;
+                    // A producer that saw this thread busy may have staged
+                    // commands just before it went idle. Only try the lock: a
+                    // drain holds it while it waits for this thread.
+                    lock.unlock();
+                    if (submission.try_lock())
+                    {
+                        takeStaged();
+                        submission.unlock();
+                    }
+                    lock.lock();
+                }
+                idle.store(false, std::memory_order_release);
+                if (pending.empty() && stopping)
+                    return;
+                // Batch small primitives without stranding a short final packet.
+                work.wait_for(lock, std::chrono::milliseconds(1), [&] {
+                    return stopping || urgent || pending.size() >= 64u;
+                });
+                batch.swap(pending);
+                urgent = false;
+            }
+            try
+            {
+                for (size_t index = 0u; index < batch.size(); ++index)
+                {
+                    const auto &command = batch[index];
+                    // Consecutive primitives under one rounding mode go to the
+                    // backend as a run: DQ8 sends over a million a second.
+                    if (command.op == Op::Submit)
+                    {
+                        size_t end = index + 1u;
+                        while (end < batch.size() && batch[end].op == Op::Submit &&
+                               batch[end].rounding == command.rounding &&
+                               bytes + (end - index) * sizeof(Command) < kReleaseBytes)
+                            ++end;
+                        if (end - index > 1u)
+                        {
+                            if (rounding != command.rounding)
+                            {
+                                std::fesetround(command.rounding);
+                                rounding = command.rounding;
+                            }
+                            run.clear();
+                            for (size_t i = index; i < end; ++i)
+                                run.push_back(&std::get<GSPrimitiveBatch>(batch[i].data));
+                            backend->SubmitMany(run.data(), run.size());
+                            for (size_t i = index; i < end; ++i)
+                                bytes += batch[i].bytes();
+                            index = end - 1u;
+                            if (bytes >= kReleaseBytes)
+                            {
+                                {
+                                    std::lock_guard lock(mutex);
+                                    outstandingBytes -= bytes;
+                                }
+                                bytes = 0u;
+                                progress.notify_all();
+                            }
+                            continue;
+                        }
+                    }
+                    execute(command);
+                    bytes += command.bytes();
+                    // A batch can hold most of a frame. Returning its space as
+                    // it drains keeps the producer going instead of stopping
+                    // it for the whole batch and then leaving this thread idle.
+                    if (bytes >= kReleaseBytes)
+                    {
+                        {
+                            std::lock_guard lock(mutex);
+                            outstandingBytes -= bytes;
+                        }
+                        bytes = 0u;
+                        progress.notify_all();
+                    }
+                }
+            }
+            catch (...)
+            {
+                std::lock_guard lock(mutex);
+                error = std::current_exception();
+                failed.store(true, std::memory_order_release);
+                for (const auto &command : batch)
+                    if (command.op == Op::Prepare)
+                        std::get<Prepare>(command.data).result->fail(error);
+                for (const auto &command : pending)
+                    if (command.op == Op::Prepare)
+                        std::get<Prepare>(command.data).result->fail(error);
+                pending.clear();
+                outstandingBytes = 0u;
+                progress.notify_all();
+                return;
+            }
+            batch.clear();
+            {
+                std::lock_guard lock(mutex);
+                outstandingBytes -= bytes;
+            }
+            progress.notify_all();
+        }
+    }
+
+    static constexpr size_t kReleaseBytes = 64u * 1024u;
+
+    std::unique_ptr<GSRasterBackend> backend;
+    const std::shared_ptr<const int> identity = std::make_shared<const int>(0);
+    const size_t capacity;
+    std::mutex submission, mutex;
+    std::condition_variable work, progress;
+    std::vector<Command> pending;
+    std::vector<Command> staged;  // guarded by `submission`
+    size_t stagedBytes = 0u;
+    std::atomic<bool> idle{false}; // the worker is waiting for commands
+    std::atomic<bool> failed{false}; // set with `error`, read without `mutex`
+    static constexpr size_t kStageCommands = 128u;
+    static constexpr size_t kStageBytes = 256u * 1024u;
+    size_t outstandingBytes = 0u;
+    bool urgent = false, stopping = false;
+    std::exception_ptr error;
+    int rounding = FE_TONEAREST;
+    std::thread worker;
+};
+
+GSThreadedBackend::GSThreadedBackend(std::unique_ptr<GSRasterBackend> backend, size_t queueBytes)
+    : m_impl(std::make_unique<Impl>(std::move(backend), queueBytes)) {}
+GSThreadedBackend::~GSThreadedBackend() = default;
+
+void GSThreadedBackend::Initialize(uint8_t *vram, uint32_t size)
+{
+    m_impl->observe([&](auto &b) { b.Initialize(vram, size); });
+}
+void GSThreadedBackend::Reset() { m_impl->observe([](auto &b) { b.Reset(); }); }
+void GSThreadedBackend::Submit(const GSPrimitiveBatch &batch)
+{
+    m_impl->enqueue({Impl::Op::Submit, batch});
+}
+void GSThreadedBackend::BeginTransfer(const GSTransferCommand &command)
+{
+    m_impl->enqueue({Impl::Op::Transfer, command});
+}
+void GSThreadedBackend::UploadImage(const uint8_t *data, uint32_t size)
+{
+    std::vector<uint8_t> bytes;
+    if (size != 0u)
+    {
+        if (!data)
+            throw std::invalid_argument("GS upload data is null");
+        bytes.assign(data, data + size);
+    }
+    m_impl->enqueue({Impl::Op::Upload, std::move(bytes)});
+}
+void GSThreadedBackend::Flush() { m_impl->enqueue({Impl::Op::Flush, {}}, true); }
+void GSThreadedBackend::TextureFlush() { m_impl->enqueue({Impl::Op::TextureFlush, {}}); }
+void GSThreadedBackend::Sync(GSSyncReason reason)
+{
+    m_impl->observe([&](auto &b) { b.Sync(reason); });
+}
+PresentationFrame GSThreadedBackend::Present(const GSPresentationRequest &request)
+{
+    if (SupportsPreparedPresentation())
+        return DisplayPreparedPresentation(PreparePresentation(request));
+    return m_impl->observe([&](auto &b) { return b.Present(request); });
+}
+bool GSThreadedBackend::SupportsPreparedPresentation() const
+{
+    return m_impl->backend->SupportsPreparedPresentation();
+}
+GSPresentationTicket GSThreadedBackend::PreparePresentation(const GSPresentationRequest &request)
+{
+    if (!SupportsPreparedPresentation()) return {};
+    auto result = std::make_shared<Impl::PresentationResult>();
+    auto ticket = std::make_shared<Impl::PresentationTicket>(m_impl->identity, result);
+    ticket->sourceVsyncTick = request.vsyncTick;
+    m_impl->enqueue({Impl::Op::Prepare, Impl::Prepare{request, std::move(result)}}, true);
+    return ticket;
+}
+PresentationFrame GSThreadedBackend::DisplayPreparedPresentation(const GSPresentationTicket &ticket)
+{
+    const auto *prepared = dynamic_cast<const Impl::PresentationTicket *>(ticket.get());
+    if (!prepared || prepared->owner != m_impl->identity)
+        throw std::invalid_argument("GS presentation ticket belongs to another backend");
+    GSPresentationTicket frame;
+    {
+        std::unique_lock lock(prepared->result->mutex);
+        prepared->result->ready.wait(lock, [&] { return prepared->result->completed; });
+        if (prepared->result->error) std::rethrow_exception(prepared->result->error);
+        frame = prepared->result->frame;
+    }
+    return m_impl->backend->DisplayPreparedPresentation(frame);
+}
+void GSThreadedBackend::CancelPreparedPresentations() noexcept
+{
+    m_impl->backend->CancelPreparedPresentations();
+}
+bool GSThreadedBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+{
+    return m_impl->observe([&](auto &b) { return b.ClearFramebuffer(context, rgba); });
+}
+uint32_t GSThreadedBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t size)
+{
+    return m_impl->observe([&](auto &b) { return b.ConsumeLocalToHostBytes(dst, size); });
+}
+uint32_t GSThreadedBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+{
+    return m_impl->observe([&](auto &b) { return b.ReadVram(psm, base, bw, x, y); });
+}
+void GSThreadedBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+{
+    m_impl->enqueue({Impl::Op::Write, Impl::Pixel{psm, base, bw, x, y, value}});
+}
+void GSThreadedBackend::SnapshotVram(std::vector<uint8_t> &out) const
+{
+    m_impl->observe([&](auto &b) { b.SnapshotVram(out); });
+}
+GSTransferSnapshot GSThreadedBackend::GetTransferSnapshot() const
+{
+    return m_impl->observe([](auto &b) { return b.GetTransferSnapshot(); });
+}

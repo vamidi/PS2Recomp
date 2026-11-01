@@ -5,6 +5,7 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/ps2_pad_host.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -13,12 +14,14 @@
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
+#include "runtime/ps2_native_iop.h"
 
 #include <iostream>
-#include <stdexcept>
 #include <fstream>
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <chrono>
@@ -42,6 +45,7 @@ static constexpr int FB_HEIGHT = 512;
 static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
 static constexpr uint32_t DEFAULT_FB_SIZE = FB_WIDTH * FB_HEIGHT * 4;
 static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x10000u);
+static std::atomic<uint64_t> s_syscallOverrideGeneration{1u};
 #if defined(PLATFORM_VITA)
 static constexpr int HOST_WINDOW_WIDTH = 960;
 static constexpr int HOST_WINDOW_HEIGHT = 544;
@@ -87,6 +91,28 @@ struct ProgramHeader
 
 namespace
 {
+    template <class Present>
+    bool presentHostFrame(PS2Runtime &runtime, Present &&present)
+    {
+        try
+        {
+            present();
+            return true;
+        }
+        catch (const std::exception &error)
+        {
+            std::fprintf(stderr, "Error during host presentation: %s\n", error.what());
+        }
+        catch (...)
+        {
+            std::fprintf(stderr, "Error during host presentation: unknown exception\n");
+        }
+        // Return to run()'s normal cleanup so its joinable guest thread cannot
+        // be destroyed by exception unwinding, including delayed GS failures.
+        runtime.requestStop();
+        return false;
+    }
+
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
@@ -479,13 +505,28 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
 
 PS2Runtime::PS2Runtime()
 {
+    // A new instance may reuse the address of a cached, destroyed runtime.
+    s_syscallOverrideGeneration.fetch_add(1u, std::memory_order_release);
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
-
     m_eeScheduler = std::make_unique<EeScheduler>(*this);
+#if defined(PS2X_IOP_ENABLE_PLUGINS) && PS2X_IOP_ENABLE_PLUGINS && \
+    !defined(PLATFORM_VITA) && (defined(_WIN32) || defined(__linux__))
+    if (const char *applicationDirectory = GetApplicationDirectory();
+        applicationDirectory && applicationDirectory[0] != '\0')
+    {
+        m_iopSubsystem->setPluginSearchPaths({std::filesystem::path(applicationDirectory) / "iop_plugins"});
+    }
+#endif
 
-    // Assign rather than memset: R5900Context's constructor zeroes itself and
-    // then applies the COP0 reset values, which a memset here would discard.
+    // Assign a default-constructed context rather than memset-ing this one.
+    // R5900Context's constructor already zeroes itself and then applies the
+    // architectural reset values on top -- COP0 Status, PRId, Random. A raw
+    // memset here silently threw those away, leaving Status at 0 for the main
+    // thread while every thread created later, which goes through
+    // `target->context = R5900Context{}` in EeScheduler::startThread, got the
+    // correct values. Guest code reads Status.IE to decide whether interrupts
+    // are enabled, so the main thread believed they were permanently off.
     m_cpuContext = R5900Context{};
 
     // R0 is always zero in MIPS
@@ -505,6 +546,12 @@ PS2Runtime::PS2Runtime()
     m_guestHeapConfigured = false;
     m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
     m_asyncCallbackStackTop = PS2_RAM_SIZE;
+}
+
+void PS2Runtime::setExternalPresenter(FramePumpCallback pump, void *userData)
+{
+    m_framePump = pump;
+    m_framePumpUserData = userData;
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -529,6 +576,8 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        // The audio callback renders from the IOP subsystem.
+        ps2_native_iop::stopAudio();
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -564,32 +613,14 @@ PS2Runtime::~PS2Runtime()
     }
 }
 
-ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+void PS2Runtime::setIopPluginSearchPaths(std::vector<std::filesystem::path> paths)
 {
-    auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
-    return m_iopSubsystem->loadModule(path, arguments, argumentSize);
-}
-
-ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
-{
-    auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
-    return m_iopSubsystem->loadModuleBuffer(guestAddress, arguments, argumentSize);
-}
-
-bool PS2Runtime::stopIopModule(int32_t moduleId, int32_t *result)
-{
-    auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
-    return m_iopSubsystem->stopModule(moduleId, result);
+    m_iopSubsystem->setPluginSearchPaths(std::move(paths));
 }
 
 ps2x::iop::RpcAbi PS2Runtime::selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const
 {
     return m_iopSubsystem->selectRpcAbi(request);
-}
-
-bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
-{
-    return m_iopSubsystem->canBindRpc(sid);
 }
 
 ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
@@ -605,11 +636,6 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
     m_iopSubsystem->onSifTransfer(transfer);
 }
 
-void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
-{
-    m_iopSubsystem->runEeCycles(eeCycles);
-}
-
 void PS2Runtime::resetIop()
 {
     m_iopSubsystem->reset();
@@ -618,36 +644,6 @@ void PS2Runtime::resetIop()
 ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
 {
     return m_iopSubsystem->debugSnapshot();
-}
-
-uint32_t PS2Runtime::allocateIopMemory(uint32_t size, uint32_t alignment)
-{
-    return m_iopSubsystem ? m_iopSubsystem->allocateMemory(size, alignment) : 0u;
-}
-
-bool PS2Runtime::freeIopMemory(uint32_t address)
-{
-    return m_iopSubsystem && m_iopSubsystem->freeMemory(address);
-}
-
-bool PS2Runtime::readIopMemory(uint32_t address, void *destination, size_t size) const
-{
-    return m_iopSubsystem && m_iopSubsystem->readMemory(address, destination, size);
-}
-
-bool PS2Runtime::writeIopMemory(uint32_t address, const void *source, size_t size)
-{
-    return m_iopSubsystem && m_iopSubsystem->writeMemory(address, source, size);
-}
-
-bool PS2Runtime::zeroIopMemory(uint32_t address, size_t size)
-{
-    return m_iopSubsystem && m_iopSubsystem->zeroMemory(address, size);
-}
-
-bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
-{
-    return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);
 }
 
 bool PS2Runtime::syncCoreSubsystems()
@@ -713,6 +709,28 @@ bool PS2Runtime::syncCoreSubsystems()
     return true;
 }
 
+// Grow the default window to an exact 2x of the PS2 output when the monitor has
+// room, so it opens both larger and integer-scaled. Resizable either way.
+static void applyDefaultWindowScale()
+{
+    constexpr int kScale = 2;
+    const int monitor = GetCurrentMonitor();
+    const int monitorWidth = GetMonitorWidth(monitor);
+    const int monitorHeight = GetMonitorHeight(monitor);
+    const int width = HOST_WINDOW_WIDTH * kScale;
+    const int height = HOST_WINDOW_HEIGHT * kScale;
+    if (monitorWidth <= 0 || monitorHeight <= 0 ||
+        width * 10 > monitorWidth * 9 || height * 10 > monitorHeight * 9)
+    {
+        return;
+    }
+
+    const Vector2 origin = GetMonitorPosition(monitor);
+    SetWindowSize(width, height);
+    SetWindowPosition(static_cast<int>(origin.x) + (monitorWidth - width) / 2,
+                      static_cast<int>(origin.y) + (monitorHeight - height) / 2);
+}
+
 bool PS2Runtime::initialize(const char *title)
 {
     try
@@ -728,15 +746,38 @@ bool PS2Runtime::initialize(const char *title)
             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
             return false;
         }
+#if defined(PS2X_IOP_ENABLE_PLUGINS) && PS2X_IOP_ENABLE_PLUGINS && \
+    !defined(PLATFORM_VITA) && (defined(_WIN32) || defined(__linux__))
+        std::string pluginError;
+        if (!m_iopSubsystem->loadPlugins(&pluginError))
+        {
+            std::cerr << "Failed to load IOP plugins: " << pluginError << std::endl;
+            return false;
+        }
+#endif
+        // An external presenter owns the window, so opening one here would put
+        // a second, empty window on screen and pay for its swap every frame.
+        if (!hasExternalPresenter())
+        {
 #if defined(PLATFORM_VITA)
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+            InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+            SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+            InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+            // Escape is bound to Circle; without this raylib also closes on it.
+            SetExitKey(KEY_NULL);
+            applyDefaultWindowScale();
+#endif
+            SetTargetFPS(60);
+        }
+#if !defined(PLATFORM_VITA)
+        // Audio is not presentation: it has no window and an external presenter
+        // does not replace it. Initialising it only in the built-in path left
+        // the audio backend permanently not-ready, which anything waiting on
+        // sound never recovers from.
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
-        SetTargetFPS(60);
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -994,14 +1035,12 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     identity.elfName = module.name;
     identity.entryPoint = m_cpuContext.pc;
     identity.crc32 = elfCrc32;
-    std::string romError;
-    if (!m_romDevice.configure(identity, &romError))
+    std::string iopError;
+    if (!m_iopSubsystem->configure(identity, &iopError))
     {
-        std::cerr << "[ROM0] failed to configure profile: " << romError << std::endl;
+        std::cerr << "[ps2xIOP] failed to configure profile: " << iopError << std::endl;
         return false;
     }
-
-    m_iopSubsystem->reset();
 
     ps2_game_overrides::applyMatching(*this,
                                       elfPath,
@@ -1070,6 +1109,9 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
 
 namespace
 {
+    std::atomic<PS2Runtime::FunctionRegionResolver> g_functionRegionResolver{nullptr};
+    std::atomic<void *> g_functionRegionResolverUserData{nullptr};
+
     bool generatedFunctionTableSlot(uint32_t address, uint32_t &slot)
     {
         if ((address & 3u) != 0u || g_ps2RecompiledFunctionTableSlotCount == 0u)
@@ -1086,21 +1128,67 @@ namespace
         slot = offset >> 2;
         return slot < g_ps2RecompiledFunctionTableSlotCount;
     }
+
+    // Generated table first, then the host's region resolver for overlaid
+    // code. Returns a pointer into the owning table so replaceFunction can
+    // patch overlay entries too.
+    PS2Runtime::RecompiledFunction *functionTableSlotPointer(uint32_t address)
+    {
+        uint32_t slot = 0u;
+        if (generatedFunctionTableSlot(address, slot))
+        {
+            return &g_ps2RecompiledFunctionTable[slot];
+        }
+
+        if ((address & 3u) != 0u)
+        {
+            return nullptr;
+        }
+
+        const PS2Runtime::FunctionRegionResolver resolver =
+            g_functionRegionResolver.load(std::memory_order_acquire);
+        if (!resolver)
+        {
+            return nullptr;
+        }
+
+        PS2Runtime::FunctionRegion *region =
+            resolver(address, g_functionRegionResolverUserData.load(std::memory_order_acquire));
+        if (!region || !region->slots || address < region->base || address >= region->end)
+        {
+            return nullptr;
+        }
+
+        const uint32_t regionSlot = (address - region->base) >> 2;
+        if (regionSlot >= region->slotCount)
+        {
+            return nullptr;
+        }
+
+        return &region->slots[regionSlot];
+    }
+}
+
+void PS2Runtime::setFunctionRegionResolver(FunctionRegionResolver resolver, void *userData)
+{
+    g_functionRegionResolverUserData.store(userData, std::memory_order_release);
+    g_functionRegionResolver.store(resolver, std::memory_order_release);
 }
 
 bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
 {
-    uint32_t slot = 0u;
-    if (!generatedFunctionTableSlot(address, slot))
+    RecompiledFunction *slot = functionTableSlotPointer(address);
+    if (!slot)
     {
         std::cerr << "[function-table] cannot replace guest PC 0x" << std::hex << address
                   << ": outside generated dense table [0x" << g_ps2RecompiledFunctionTableBase
                   << ", 0x" << g_ps2RecompiledFunctionTableEnd << ")"
+                  << " and not claimed by a function-region resolver"
                   << std::dec << std::endl;
         return false;
     }
 
-    g_ps2RecompiledFunctionTable[slot] = func;
+    *slot = func;
     return true;
 }
 
@@ -1111,8 +1199,8 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
-    uint32_t slot = 0u;
-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
+    const RecompiledFunction *slot = functionTableSlotPointer(address);
+    return slot != nullptr && *slot != nullptr;
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
@@ -1138,13 +1226,11 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
 
-    uint32_t slot = 0u;
-    if (generatedFunctionTableSlot(address, slot))
+    if (const RecompiledFunction *slot = functionTableSlotPointer(address))
     {
-        RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot];
-        if (fn != nullptr)
+        if (*slot != nullptr)
         {
-            return fn;
+            return *slot;
         }
     }
 
@@ -1387,8 +1473,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         if (policy == MissingFunctionPolicy::ContinueToTarget)
         {
             ctx->pc = targetPc;
-            // if you need the app to keep open to open debug pannel change this to false
-            return false;
+            return true;
         }
 
         return false;
@@ -1969,10 +2054,27 @@ uint32_t PS2Runtime::guestHeapEnd() const
     return m_guestHeapConfigured ? m_guestHeapEnd : m_guestHeapSuggestedBase;
 }
 
+void PS2Runtime::setGuestHeapCeiling(uint32_t ceiling)
+{
+    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+    m_guestHeapCeiling = ceiling;
+}
+
+uint32_t PS2Runtime::guestHeapCeiling() const
+{
+    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+    return m_guestHeapCeiling;
+}
+
 uint32_t PS2Runtime::guestHeapLimit() const
 {
     std::lock_guard<std::mutex> lock(m_guestHeapMutex);
     return m_guestHeapConfigured ? m_guestHeapLimit : m_guestHeapSuggestedBase;
+}
+
+uint32_t PS2Runtime::guestHeapHardLimit() const
+{
+    return std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
 }
 
 uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment)
@@ -2011,6 +2113,12 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
 
     m_asyncCallbackStackTop = base;
     return top - 0x10u;
+}
+
+uint32_t PS2Runtime::asyncCallbackStackTop() const
+{
+    std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+    return m_asyncCallbackStackTop;
 }
 
 uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
@@ -2253,8 +2361,29 @@ void PS2Runtime::removeEeExitHandlers(int threadId)
 
 bool PS2Runtime::findEeSyscallOverride(uint32_t syscallNumber, uint32_t &handler) const
 {
+    struct CachedOverride
+    {
+        const PS2Runtime *owner = nullptr;
+        uint64_t generation = 0u;
+        uint32_t number = 0u;
+        uint32_t handler = 0u;
+        bool found = false;
+    };
+    // Polling loops repeatedly call the same syscall with no override.
+    // Cache misses still read the map under its lock; every mutation invalidates.
+    static thread_local CachedOverride cache;
+    const uint64_t generation = s_syscallOverrideGeneration.load(std::memory_order_acquire);
+    if (cache.owner == this && cache.generation == generation && cache.number == syscallNumber)
+    {
+        if (cache.found)
+            handler = cache.handler;
+        return cache.found;
+    }
     std::lock_guard lock(m_eeKernelStateMutex);
     const auto it = m_eeSyscallOverrides.find(syscallNumber);
+    cache = {this, generation, syscallNumber,
+             it == m_eeSyscallOverrides.end() ? 0u : it->second,
+             it != m_eeSyscallOverrides.end()};
     if (it == m_eeSyscallOverrides.end())
     {
         return false;
@@ -2279,6 +2408,7 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
     {
         m_eeSyscallOverrides[syscallNumber] = handler;
     }
+    s_syscallOverrideGeneration.fetch_add(1u, std::memory_order_release);
     if (!rdram || address < 0 || address + 4 > kMirrorLimit)
     {
         return;
@@ -2357,10 +2487,17 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
-    // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
-    Texture2D frameTex = LoadTextureFromImage(blank);
-    UnloadImage(blank);
+    // A blank image to use as a framebuffer. Not needed when something else
+    // owns the window -- there is no GL context to create a texture in.
+    Texture2D frameTex{};
+    int frameTexFilter = TEXTURE_FILTER_POINT;
+    if (!hasExternalPresenter())
+    {
+        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+        frameTex = LoadTextureFromImage(blank);
+        UnloadImage(blank);
+        SetTextureFilter(frameTex, frameTexFilter);
+    }
 
     std::atomic<bool> gameThreadFinished{false};
 
@@ -2385,9 +2522,27 @@ void PS2Runtime::run()
         }
         gameThreadFinished.store(true, std::memory_order_release); });
 
+    const char *kernelTraceEnv = std::getenv("PS2X_KERNEL_TRACE_MS");
+    const auto kernelTraceInterval = std::chrono::milliseconds(kernelTraceEnv ? std::max(0, std::atoi(kernelTraceEnv)) : 0);
+    auto nextKernelTrace = std::chrono::steady_clock::now() + kernelTraceInterval;
     uint64_t tick = 0;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        if (kernelTraceInterval.count() > 0 && std::chrono::steady_clock::now() >= nextKernelTrace)
+        {
+            const auto snapshot = m_eeScheduler->snapshot();
+            std::fprintf(stderr, "[ee-kernel] sequence=%llu cycle=%llu running=%d\n",
+                         static_cast<unsigned long long>(snapshot.sequence),
+                         static_cast<unsigned long long>(snapshot.eeCycle), snapshot.runningThreadId);
+            for (const auto &thread : snapshot.threads)
+                std::fprintf(stderr, "  thread=%d pc=%08x ra=%08x sp=%08x entry=%08x priority=%d state=%d wait=%d object=%d\n",
+                             thread.id, thread.pc, thread.ra, thread.sp, thread.entry, thread.currentPriority,
+                             static_cast<int>(thread.status), static_cast<int>(thread.waitReason), thread.waitId);
+            for (const auto &sema : snapshot.semaphores)
+                if (sema.waiters)
+                    std::fprintf(stderr, "  sema=%d count=%d waiters=%u\n", sema.id, sema.count, sema.waiters);
+            nextKernelTrace = std::chrono::steady_clock::now() + kernelTraceInterval;
+        }
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
             if ((tick % 120) == 0)
@@ -2417,12 +2572,54 @@ void PS2Runtime::run()
                                                << " gsw=" << curGs
                                                << " vif=" << curVif
                                                << std::endl);
-
             }
         });
+        // With an external presenter the backend draws to its own swapchain,
+        // so the frame still has to be latched -- that is what calls into the
+        // backend's Present() -- but nothing is uploaded or drawn here.
+        ps2PadSetGuestFrame(eeScheduler().currentVSyncTick());
+        if (m_framePump)
+        {
+            static uint64_t s_lastNativeTick = std::numeric_limits<uint64_t>::max();
+            const uint64_t currentTick = eeScheduler().currentVSyncTick();
+            const bool newFrame = currentTick != s_lastNativeTick;
+            if (newFrame)
+            {
+                if (!presentHostFrame(*this, [&] { gs().latchHostPresentationFrame(); }))
+                    break;
+                s_lastNativeTick = currentTick;
+            }
+            else
+            {
+                // Nothing new to show. Without this the loop spins a core flat
+                // out waiting for the guest, which is a core the EE thread
+                // wants; the raylib path got the same effect from its frame
+                // limiter blocking in EndDrawing().
+                //
+                // Tunable because how often this thread wakes changes the
+                // interleaving the EE thread sees, and the memory-card boot
+                // race is sensitive to exactly that
+                // (docs/notes/memory-card-boot-race.md).
+                static const int idleMicros = [] {
+                    const char *value = std::getenv("DQ8_PRESENT_IDLE_US");
+                    const int parsed = value ? std::atoi(value) : 0;
+                    return parsed > 0 ? parsed : 1000;
+                }();
+                std::this_thread::sleep_for(std::chrono::microseconds(idleMicros));
+            }
+            if (!m_framePump(m_framePumpUserData))
+            {
+                RUNTIME_LOG("[run] external presenter requested stop");
+                requestStop();
+                break;
+            }
+            continue;
+        }
+
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        if (!presentHostFrame(*this, [&] { UploadFrame(frameTex, this, presentWidth, presentHeight); }))
+            break;
 
         BeginDrawing();
         ClearBackground(BLACK);
@@ -2430,13 +2627,24 @@ void PS2Runtime::run()
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
+        const float fitScale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
+        // Snap upscales to an integer multiple: a fractional nearest-neighbour scale
+        // duplicates some pixel columns and not others, which shreds 1px font stems.
+        const bool integerScale = fitScale >= 1.0f;
+        const float scale = integerScale ? std::floor(fitScale) : fitScale;
+        const int wantedFilter = integerScale ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR;
+        if (wantedFilter != frameTexFilter)
+        {
+            SetTextureFilter(frameTex, wantedFilter);
+            frameTexFilter = wantedFilter;
+        }
         const float dstWidth = srcWidth * scale;
         const float dstHeight = srcHeight * scale;
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
+        // Whole-pixel origin, else centring can land the quad on a half pixel.
         const Rectangle dstRect{
-            (screenWidth - dstWidth) * 0.5f,
-            (screenHeight - dstHeight) * 0.5f,
+            std::floor((screenWidth - dstWidth) * 0.5f),
+            std::floor((screenHeight - dstHeight) * 0.5f),
             dstWidth,
             dstHeight};
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
@@ -2445,6 +2653,7 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+        ps2PadPollHost(); // EndDrawing() polled raylib input; latch edges for the EE thread
 
         if (WindowShouldClose())
         {
@@ -2465,8 +2674,11 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
-    UnloadTexture(frameTex);
-    CloseWindow();
+    if (!hasExternalPresenter())
+    {
+        UnloadTexture(frameTex);
+        CloseWindow();
+    }
 
     RUNTIME_LOG("[run] exiting loop");
 }

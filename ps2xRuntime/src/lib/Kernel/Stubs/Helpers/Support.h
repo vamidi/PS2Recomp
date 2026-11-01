@@ -29,6 +29,11 @@ namespace
     uint32_t g_cdStreamingEndLbn = 0xFFFFFFFFu;
     bool g_cdInitialized = false;
 
+    constexpr uint32_t kIopHeapBase = 0x04000000;
+    constexpr uint32_t kIopHeapLimit = 0x04500000;
+    constexpr uint32_t kIopHeapAlign = 64;
+    uint32_t g_iopHeapNext = kIopHeapBase;
+
     std::string toLowerAscii(std::string value)
     {
         std::transform(value.begin(), value.end(), value.begin(),
@@ -1356,10 +1361,8 @@ namespace
         uint32_t qwc = 0;
         uint32_t tadr = payloadPhys;
         PS2Memory &mem = runtime->memory();
-
-        const uint32_t configuredChcr = mem.readIORegister(channelBase + 0x00u);
-        const uint32_t transferTagEnable = configuredChcr & 0x00000040u;
-        uint32_t chcr = 0x00000181u | transferTagEnable; // DIR=1, TIE=1, STR=1 (normal mode).
+        // The SDK changes MODE, DIR and STR while preserving TTE and TIE.
+        uint32_t chcr = (mem.readIORegister(channelBase) & ~0xCu) | 0x101u;
 
         if (preferNormalCount)
         {
@@ -1368,7 +1371,7 @@ namespace
         }
         else
         {
-            chcr = 0x00000185u | transferTagEnable; // MODE=1 chain, DIR=1, TIE=1, STR=1.
+            chcr |= 0x4u; // MODE=1 chain.
         }
 
         mem.writeIORegister(channelBase + 0x20u, qwc & 0xFFFFu);
@@ -1400,10 +1403,10 @@ namespace
             if (g_dmaStubLogCount < kMaxDmaStubLogs)
             {
                 RUNTIME_LOG("[sceDmaSend] ch=0x" << std::hex << channelBase
-                                                 << " madr=0x" << madr
-                                                 << " qwc=0x" << qwc
-                                                 << " tadr=0x" << tadr
-                                                 << " chcr=0x" << chcr << std::dec << std::endl);
+                          << " madr=0x" << madr
+                          << " qwc=0x" << qwc
+                          << " tadr=0x" << tadr
+                          << " chcr=0x" << chcr << std::dec << std::endl);
 
                 if (!preferNormalCount && (channelBase == 0x10009000u || channelBase == 0x1000A000u))
                 {
@@ -1416,13 +1419,13 @@ namespace
                         std::memcpy(&w2, tagPtr + 8u, sizeof(w2));
                         std::memcpy(&w3, tagPtr + 12u, sizeof(w3));
                         RUNTIME_LOG("[sceDmaSend:head] ch=0x" << std::hex << channelBase
-                                                              << " tagQwc=0x" << static_cast<uint32_t>(tagLo & 0xFFFFu)
-                                                              << " id=0x" << static_cast<uint32_t>((tagLo >> 28u) & 0x7u)
-                                                              << " irq=0x" << static_cast<uint32_t>((tagLo >> 31u) & 0x1u)
-                                                              << " addr=0x" << static_cast<uint32_t>((tagLo >> 32u) & 0x7FFFFFFFu)
-                                                              << " w2=0x" << w2
-                                                              << " w3=0x" << w3
-                                                              << std::dec << std::endl);
+                                  << " tagQwc=0x" << static_cast<uint32_t>(tagLo & 0xFFFFu)
+                                  << " id=0x" << static_cast<uint32_t>((tagLo >> 28u) & 0x7u)
+                                  << " irq=0x" << static_cast<uint32_t>((tagLo >> 31u) & 0x1u)
+                                  << " addr=0x" << static_cast<uint32_t>((tagLo >> 32u) & 0x7FFFFFFFu)
+                                  << " w2=0x" << w2
+                                  << " w3=0x" << w3
+                                  << std::dec << std::endl);
                     }
                 }
                 ++g_dmaStubLogCount;
@@ -1836,9 +1839,9 @@ namespace
         return true;
     }
 
-    static bool readGsDBuff(uint8_t *rdram, uint32_t addr, GsDBuffMem &out)
+    static bool readGsDBuff(uint8_t* rdram, uint32_t addr, GsDBuffMem& out)
     {
-        const uint8_t *ptr = getConstMemPtr(rdram, addr);
+        const uint8_t* ptr = getConstMemPtr(rdram, addr);
         if (!ptr)
             return false;
         std::memcpy(&out, ptr, sizeof(out));
@@ -1854,9 +1857,9 @@ namespace
         return true;
     }
 
-    static bool writeGsDBuff(uint8_t *rdram, uint32_t addr, const GsDBuffMem &db)
+    static bool writeGsDBuff(uint8_t* rdram, uint32_t addr, const GsDBuffMem& db)
     {
-        uint8_t *ptr = getMemPtr(rdram, addr);
+        uint8_t* ptr = getMemPtr(rdram, addr);
         if (!ptr)
             return false;
         std::memcpy(ptr, &db, sizeof(db));

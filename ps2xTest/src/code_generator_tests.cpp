@@ -2,6 +2,7 @@
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/ps2_recompiler.h"
+#include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/types.h"
 #include <filesystem>
 #include <fstream>
@@ -168,41 +169,45 @@ void register_code_generator_tests()
 {
     MiniTest::Case("CodeGenerator", [](TestCase &tc)
                    {
-    tc.Run("Generated sources cannot be shadowed by stale local declaration headers", [](TestCase &t) {
-        Function func;
-        func.name = "header_lookup";
-        func.start = 0x8F00;
-        func.end = 0x8F04;
-        func.isRecompiled = true;
-
+    tc.Run("R5900 SQRT.S reads ft while other unary operations read fs", [](TestCase &t) {
         CodeGenerator gen({}, {});
-        gen.setRenamedFunctions({{func.start, "header_lookup_0x8f00"}});
-
-        const std::string generated = gen.generateFunction(func, {makeNop(func.start)}, true);
-        const std::string registration = gen.generateFunctionRegistration({func}, {});
-
-        t.IsTrue(generated.find("#include <ps2_recompiled_functions.h>") != std::string::npos,
-                 "function sources must resolve declarations through the configured include path");
-        t.IsTrue(generated.find("#include <ps2_recompiled_stubs.h>") != std::string::npos,
-                 "function sources must resolve stub declarations through the configured include path");
-        t.IsTrue(registration.find("#include <ps2_recompiled_functions.h>") != std::string::npos,
-                 "the registration source must use the same unambiguous declaration header");
-        t.IsTrue(registration.find("#include <ps2_recompiled_stubs.h>") != std::string::npos,
-                 "the registration source must use the same unambiguous stub header");
+        R5900Decoder decoder;
+        for (unsigned source = 0; source < 32; ++source) {
+            for (unsigned destination = 0; destination < 32; ++destination) {
+                const uint32_t raw = (OPCODE_COP1 << 26) | (COP1_S << 21) |
+                                     (source << 16) | (destination << 6) | COP1_S_SQRT;
+                const auto inst = decoder.decodeInstruction(0x1000, raw);
+                const auto generated = gen.translateInstruction(inst);
+                const std::string expected = "ctx->f[" + std::to_string(destination) +
+                    "] = FPU_SQRT_S(ctx->f[" + std::to_string(source) + "]);";
+                t.IsTrue(generated.find(expected) != std::string::npos,
+                         "SQRT.S operand comes from instruction bits 20:16");
+            }
+        }
+        const uint32_t rawAbs = (OPCODE_COP1 << 26) | (COP1_S << 21) |
+                                (7u << 11) | (3u << 6) | COP1_S_ABS;
+        const auto absolute = gen.translateInstruction(decoder.decodeInstruction(0x1000, rawAbs));
+        t.IsTrue(absolute.find("ctx->f[3] = FPU_ABS_S(ctx->f[7]);") != std::string::npos,
+                 "ABS.S keeps its different fs operand encoding");
     });
 
-    tc.Run("unsigned integer loads use explicit zero extension", [](TestCase &t) {
+    tc.Run("RSQRT keeps its numerator on the FPU and in VU0 macro mode", [](TestCase &t) {
         CodeGenerator gen({}, {});
-        const std::string lbu = gen.translateInstruction(makeIType(0x8F10, OPCODE_LBU, 1, 2, 0x10));
-        const std::string lhu = gen.translateInstruction(makeIType(0x8F14, OPCODE_LHU, 1, 3, 0x12));
-        const std::string lwu = gen.translateInstruction(makeIType(0x8F18, OPCODE_LWU, 1, 4, 0x14));
+        R5900Decoder decoder;
+        const uint32_t rawFpu = (OPCODE_COP1 << 26) | (COP1_S << 21) | (4u << 16) |
+                                (9u << 11) | (2u << 6) | COP1_S_RSQRT;
+        const auto fpu = gen.translateInstruction(decoder.decodeInstruction(0x1000, rawFpu));
+        t.IsTrue(fpu.find("ctx->f[2] = ctx->f[9] / sqrtf(ctx->f[4]);") != std::string::npos,
+                 "RSQRT.S divides fs by the root of ft");
 
-        t.IsTrue(lbu.find("SET_GPR_ZE32(ctx, 2") != std::string::npos,
-                 "LBU must zero-extend into the low 64-bit scalar lane");
-        t.IsTrue(lhu.find("SET_GPR_ZE32(ctx, 3") != std::string::npos,
-                 "LHU must zero-extend into the low 64-bit scalar lane");
-        t.IsTrue(lwu.find("SET_GPR_ZE32(ctx, 4") != std::string::npos,
-                 "LWU must not sign-extend bit 31 into the allocator bitmap value");
+        // vrsqrt Q, vf12x, vf6x, as Dragon Quest VIII's distance constraints use it.
+        const auto vu = gen.translateInstruction(decoder.decodeInstruction(0x1000, 0x4a0663beu));
+        const size_t numerator = vu.find("ctx->vu0_vf[12], ctx->vu0_vf[12], _MM_SHUFFLE(0,0,0,0)");
+        const size_t radicand = vu.find("ctx->vu0_vf[6], ctx->vu0_vf[6], _MM_SHUFFLE(0,0,0,0)");
+        t.IsTrue(numerator != std::string::npos && radicand != std::string::npos && numerator < radicand,
+                 "VRSQRT reads fs.fsf as the numerator and ft.ftf as the radicand");
+        t.IsTrue(vu.find("ctx->vu0_q = (ft > 0.0f) ? (fs / sqrtf(ft)) : 0.0f;") != std::string::npos,
+                 "VRSQRT divides the numerator by the root and keeps 0 for other radicands");
     });
 
     tc.Run("SYSCALL publishes its continuation before entering the runtime", [](TestCase &t) {
@@ -231,42 +236,6 @@ void register_code_generator_tests()
                  "generated syscall must still dispatch the encoded syscall");
         t.IsTrue(continuation < dispatch,
                  "the continuation PC must be visible before a syscall can transfer to the scheduler");
-    });
-
-    tc.Run("SYSCALL fallthrough is a resumable entry", [](TestCase &t) {
-        Function func;
-        func.name = "syscall_resume_entry";
-        func.start = 0x9100;
-        func.end = 0x9108;
-        func.isRecompiled = true;
-
-        Instruction syscall{};
-        syscall.address = 0x9100;
-        syscall.opcode = OPCODE_SPECIAL;
-        syscall.function = SPECIAL_SYSCALL;
-        syscall.raw = (0x83u << 6) | SPECIAL_SYSCALL;
-
-        Instruction after = makeNop(0x9104);
-        CodeGenerator gen({}, {});
-        CodeGenerator::AnalysisResult analysis =
-            gen.collectInternalBranchTargets(func, {syscall, after});
-
-        t.IsTrue(analysis.resumeEntryPoints.contains(0x9104u),
-                 "a syscall can yield through a guest override, so its fallthrough must be resumable");
-
-        const std::string generated = gen.generateFunction(func, {syscall, after}, false);
-        t.IsTrue(generated.find("case 0x9104u: goto label_9104;") != std::string::npos,
-                 "the owner wrapper must resume directly after the syscall");
-
-        gen.setRenamedFunctions({{0x9100u, "syscall_resume_entry_0x9100"}});
-        gen.setResumeEntryTargets({{0x9100u,
-                                    std::vector<uint32_t>(analysis.resumeEntryPoints.begin(),
-                                                          analysis.resumeEntryPoints.end())}});
-        const std::string registration = gen.generateFunctionRegistration({func}, {});
-        t.IsTrue(registration.find(
-                     "g_ps2RecompiledFunctionTable[1] = syscall_resume_entry_0x9100; // 0x9104") !=
-                     std::string::npos,
-                 "the syscall continuation must register to the owner wrapper");
     });
 
     tc.Run("R5900 MULT writes rd when rd is non-zero", [](TestCase &t) {
@@ -329,21 +298,6 @@ void register_code_generator_tests()
                  "constant MMIO SW should emit a direct runtime Store32");
         t.IsTrue(generated.find("WRITE32(ADD32(GPR_U32(ctx, 1)") == std::string::npos,
                  "constant MMIO SW should not go through WRITE32 address classification");
-    });
-
-    tc.Run("stale MMIO annotation does not replace the guest effective address", [](TestCase &t) {
-        Instruction store = makeSw(0x1100, 2, 1, 0);
-        store.isMmio = true;
-        store.mmioAddress = 0x10000000u; // A stale analyzer hint; $at still owns the real address.
-
-        CodeGenerator gen({}, {});
-        const std::string generated = gen.translateInstruction(store);
-        printGeneratedCode("stale MMIO annotation does not replace the guest effective address", generated);
-
-        t.IsTrue(generated.find("runtime->Store32(rdram, ctx, ADD32(GPR_U32(ctx, 1), 0), GPR_U32(ctx, 2))") != std::string::npos,
-                 "MMIO annotations should select runtime access without hard-coding a possibly stale address");
-        t.IsTrue(generated.find("0x10000000u") == std::string::npos,
-                 "stale MMIO address should not replace the address calculated by guest registers");
     });
 
     tc.Run("constant RDRAM load and store emit fast memory access", [](TestCase &t) {
@@ -628,7 +582,7 @@ void register_code_generator_tests()
                   "unresolved JR should not pretend it has a resolved local jump table");
     });
 
-    tc.Run("unresolved JALR marks internal labels as indirect fallback resume entries", [](TestCase &t) {
+    tc.Run("unresolved JALR resumes after the call without promoting the function", [](TestCase &t) {
         Function func;
         func.name = "unresolved_jalr_fallback";
         func.start = 0x3200;
@@ -647,10 +601,21 @@ void register_code_generator_tests()
         CodeGenerator gen({}, {});
         CodeGenerator::AnalysisResult analysis = gen.collectInternalBranchTargets(func, instructions);
 
-        t.IsTrue(analysis.indirectFallbackEntryPoints.contains(0x320Cu),
-                 "unresolved JALR should register internal labels as resumable entries for the owning function");
+        // JALR is a call: it returns past the delay slot, so 0x320C is the only
+        // address in this function that has to be reachable from outside.
+        t.IsTrue(analysis.resumeEntryPoints.contains(0x320Cu),
+                 "unresolved JALR should mark its return pc as resumable");
         t.IsTrue(analysis.entryPoints.contains(0x320Cu),
-                 "unresolved JALR fallback targets should still emit labels in the owner");
+                 "unresolved JALR resume pc should still emit a label in the owner");
+
+        // Both sets feed the same owner resume-target list, so the return pc is
+        // registered either way; what must not happen is the whole-function
+        // promotion reserved for jumps that could land anywhere.
+        t.IsFalse(analysis.indirectFallbackEntryPoints.contains(0x3210u),
+                  "an indirect call must not promote unrelated instructions to entry points");
+        t.IsFalse(analysis.indirectFallbackEntryPoints.contains(0x3200u),
+                  "an indirect call must not promote the function start to a fallback entry");
+
         t.IsFalse(analysis.jumpTableTargets.contains(0x3204u),
                   "unresolved JALR should not pretend it has a resolved local jump table");
     });
@@ -658,6 +623,11 @@ void register_code_generator_tests()
     tc.Run("syscall marks the following instruction as a resume entry", [](TestCase &t) {
         // Shape of a real SDK syscall wrapper:
         //   addiu $v1, $zero, <num> ; syscall ; jr $ra ; <delay slot>
+        // SetSyscall lets a guest install its own handler for a syscall number,
+        // and the runtime then suspends the calling thread to run that handler
+        // as a separate invocation. The parent thread's saved pc is the address
+        // after the syscall, so the scheduler needs an entry point there to
+        // resume it -- otherwise the thread is made dormant and silently dies.
         Function func;
         func.name = "syscall_wrapper";
         func.start = 0x4000;
@@ -732,46 +702,6 @@ void register_code_generator_tests()
                  "resume entry pc should register to the owner wrapper");
         t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[3] = resume_owner_0x7000; // 0x700c") != std::string::npos,
                  "multiple resume pcs should register to the same owner wrapper");
-    });
-
-    tc.Run("configured internal guest handlers register to their owner wrapper", [](TestCase &t) {
-        Function owner;
-        owner.name = "sdk_bootstrap_owner";
-        owner.start = 0x7000;
-        owner.end = 0x7020;
-        owner.isRecompiled = true;
-        owner.isStub = false;
-
-        std::vector<Instruction> instructions{
-            makeNop(0x7000), makeNop(0x7004), makeNop(0x7008), makeNop(0x700C),
-            makeNop(0x7010), makeNop(0x7014), makeNop(0x7018), makeNop(0x701C)};
-        std::vector<Function> functions{owner};
-        std::unordered_map<uint32_t, std::vector<Instruction>> decoded{{owner.start, instructions}};
-        std::unordered_map<uint32_t, std::vector<uint32_t>> targetsByOwner;
-
-        const size_t added = PS2Recompiler::CollectInternalEntryTargets(
-            functions, decoded, {0x7008u, 0x7018u}, targetsByOwner);
-
-        t.IsTrue(added == 2u,
-                 "both address-qualified internal handlers should be promoted");
-        t.IsTrue(targetsByOwner.at(owner.start).size() == 2u,
-                 "both handlers should belong to the containing generated wrapper");
-
-        CodeGenerator gen({}, {});
-        gen.setRenamedFunctions({{owner.start, "sdk_bootstrap_owner_0x7000"}});
-        gen.setResumeEntryTargets(targetsByOwner);
-
-        const std::string generated = gen.generateFunction(owner, instructions, false);
-        const std::string registration = gen.generateFunctionRegistration(functions, {});
-
-        t.IsTrue(generated.find("case 0x7008u: goto label_7008;") != std::string::npos,
-                 "the owner must enter directly at the first installed handler");
-        t.IsTrue(generated.find("case 0x7018u: goto label_7018;") != std::string::npos,
-                 "the owner must enter directly at the second installed handler");
-        t.IsTrue(registration.find("sdk_bootstrap_owner_0x7000; // 0x7008") != std::string::npos,
-                 "the first handler address must dispatch to its owner wrapper");
-        t.IsTrue(registration.find("sdk_bootstrap_owner_0x7000; // 0x7018") != std::string::npos,
-                 "the second handler address must dispatch to its owner wrapper");
     });
 
     tc.Run("external mid-function entry can register to the owner wrapper", [](TestCase &t) {

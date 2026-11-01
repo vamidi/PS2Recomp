@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <vector>
 #include <string>
-#include <string_view>
 #include <functional>
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -31,8 +30,6 @@
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_pad.h"
-#include "runtime/ps2_rom_device.h"
-#include "runtime/ps2_vfs.h"
 #include "ps2x/iop/iop_types.h"
 
 namespace ps2x::iop
@@ -153,9 +150,32 @@ struct alignas(16) R5900Context
 
         // Reset COP0 registers
         cop0_random = 47; // Start at maximum value
-        // Status as the EE kernel leaves it at handoff. IE (bit 0) and EIE
-        // (bit 16) are separate enables and guest code reads both; libkernel's
-        // StartThread refuses to run while IE is clear.
+        // Status as the EE kernel leaves it when it hands control to the game,
+        // which is the state recompiled code starts in -- we never execute the
+        // boot ROM that would otherwise set this up.
+        //
+        // Both interrupt-enable bits matter, and they are not the same bit:
+        //
+        //   IE  (bit 0)     the architectural MIPS interrupt enable. The kernel
+        //                   sets it once during boot and it normally stays set.
+        //   EIE (bit 16)    the EE-specific enable that the `ei` and `di`
+        //                   instructions toggle.
+        //
+        // Interrupts are only really on when both are set, and guest code reads
+        // them separately. libkernel's StartThread, for instance, opens with
+        // `mfc0 Status; xori 1; andi 1` and refuses to run when IE is clear --
+        // that is its "you must call iStartThread from an interrupt handler"
+        // guard. Leaving Status at zero made that guard fire forever, so every
+        // StartThread returned -1 and any game that creates a thread stalled
+        // with no diagnostic.
+        //
+        // EIE matters for the matching reason: DIntr reports whether it was set
+        // so the caller knows whether to pair it with an EIntr. Starting at zero
+        // makes DIntr always answer "already disabled" and the re-enable never
+        // happens.
+        //
+        // BEV (0x00400000) is deliberately not set: that selects the boot
+        // exception vectors, which is the pre-handoff state, not this one.
         cop0_status = 0x00010001; // EIE | IE
         cop0_prid = 0x00002e20; // CPU ID for R5900
 
@@ -290,22 +310,25 @@ public:
     bool loadELF(const std::string &elfPath);
     void run();
 
-    [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
-    [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
-    [[nodiscard]] bool stopIopModule(int32_t moduleId, int32_t *result = nullptr);
+    void setIopPluginSearchPaths(std::vector<std::filesystem::path> paths);
     [[nodiscard]] ps2x::iop::DebugSnapshot iopDebugSnapshot() const;
-    uint32_t allocateIopMemory(uint32_t size, uint32_t alignment = 16u);
-    bool freeIopMemory(uint32_t address);
-    bool readIopMemory(uint32_t address, void *destination, size_t size) const;
-    bool writeIopMemory(uint32_t address, const void *source, size_t size);
-    bool zeroIopMemory(uint32_t address, size_t size);
-    bool isIopMemoryRange(uint32_t address, size_t size) const;
 
     using DebugUiCallback = void (*)(PS2Runtime &runtime, void *userData);
     void setDebugUiCallbacks(DebugUiCallback initCallback,
                              DebugUiCallback drawCallback,
                              DebugUiCallback shutdownCallback,
                              void *userData);
+
+    // A host that owns its own window and shows frames itself. When one is
+    // installed the runtime opens no window of its own and does no drawing:
+    // the raster backend has already presented by the time Present() returns,
+    // and this is called once per frame to service the window. Returning false
+    // asks the runtime to stop, the way a close button would.
+    //
+    // Set before initialize(), which is where the built-in window is created.
+    using FramePumpCallback = bool (*)(void *userData);
+    void setExternalPresenter(FramePumpCallback pump, void *userData);
+    [[nodiscard]] bool hasExternalPresenter() const { return m_framePump != nullptr; }
 
     using RecompiledFunction = void (*)(uint8_t *, R5900Context *, PS2Runtime *);
 
@@ -332,6 +355,25 @@ public:
         // Escape hatch only: skip missing calls by returning to fallthrough (it can hide guest bugs)
         SkipCallDebug = 3,
     };
+
+    // Overlaid guest code: one dense table per streamed-in image, so the same
+    // arena address can mean different code depending on which is resident.
+    // The host owns the images and answers "which table covers this address?".
+    struct FunctionRegion
+    {
+        uint32_t base = 0u;            // first guest address covered
+        uint32_t end = 0u;             // one past the last covered address
+        uint32_t slotCount = 0u;       // entries in `slots`
+        RecompiledFunction *slots = nullptr; // dense, indexed (addr - base) >> 2
+    };
+
+    // Return the region covering `address`, or nullptr. Called on the guest
+    // thread from dispatch, so it must be cheap and must not block.
+    using FunctionRegionResolver = FunctionRegion *(*)(uint32_t address, void *userData);
+
+    // Global rather than per-instance to match the generated table it extends.
+    // Passing nullptr removes the resolver.
+    static void setFunctionRegionResolver(FunctionRegionResolver resolver, void *userData);
 
     bool replaceFunction(uint32_t address, RecompiledFunction func);
     // TODO remove this later need to update all tests
@@ -381,9 +423,21 @@ public:
     uint32_t guestRealloc(uint32_t guestAddr, uint32_t newSize, uint32_t alignment = 16u);
     void guestFree(uint32_t guestAddr);
     uint32_t guestHeapBase() const;
+
+    // Ceiling for a guest that grows its own heap through sbrk/EndOfHeap.
+    // Zero (default) makes EndOfHeap report guestHeapLimit(), as before.
+    void setGuestHeapCeiling(uint32_t ceiling);
+    uint32_t guestHeapCeiling() const;
+
     uint32_t guestHeapEnd() const;
     uint32_t guestHeapLimit() const;
+
+    // Highest address any heap may reach. Unlike guestHeapLimit() this is
+    // valid before the heap is configured, so a caller can split the range.
+    uint32_t guestHeapHardLimit() const;
     uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
+    // Where the next invocation stack would be carved down from.
+    uint32_t asyncCallbackStackTop() const;
 
     void drainCompletedDmacHandlers(uint8_t *rdram);
 
@@ -451,10 +505,6 @@ public:
     inline const PS2AudioBackend &audioBackend() const { return m_audioBackend; }
     inline PSPadBackend &padBackend() { return m_padBackend; }
     inline const PSPadBackend &padBackend() const { return m_padBackend; }
-    inline PS2RomDevice &romDevice() { return m_romDevice; }
-    inline const PS2RomDevice &romDevice() const { return m_romDevice; }
-    inline PS2Vfs &vfs() { return m_vfs; }
-    inline const PS2Vfs &vfs() const { return m_vfs; }
 
 private:
     struct GuestHeapBlock
@@ -478,10 +528,8 @@ private:
     void HandleIntegerOverflow(R5900Context *ctx);
 
     [[nodiscard]] ps2x::iop::RpcAbi selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const;
-    [[nodiscard]] bool canBindIopRpc(uint32_t sid) const noexcept;
     [[nodiscard]] ps2x::iop::RpcResult handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request);
     void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);
-    void advanceIopEeCycles(uint64_t eeCycles) noexcept;
     void resetIop();
 
     friend class PS2IopTransport;
@@ -495,8 +543,6 @@ private:
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
-    PS2RomDevice m_romDevice;
-    PS2Vfs m_vfs;
     VU1Interpreter m_vu0{VU1Interpreter::Unit::VU0};
     VU1Interpreter m_vu1{VU1Interpreter::Unit::VU1};
     R5900Context m_cpuContext;
@@ -511,6 +557,7 @@ private:
     uint32_t m_guestHeapBase = 0x00100000u;
     uint32_t m_guestHeapEnd = 0x00100000u;
     uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
+    uint32_t m_guestHeapCeiling = 0u;
     uint32_t m_guestHeapSuggestedBase = 0x00100000u;
     bool m_guestHeapConfigured = false;
     uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
@@ -519,6 +566,8 @@ private:
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
     std::atomic<bool> m_missingFunctionReported{false};
     std::atomic<bool> m_stopRequested{false};
+    FramePumpCallback m_framePump = nullptr;
+    void *m_framePumpUserData = nullptr;
     DebugUiCallback m_debugUiInitCallback = nullptr;
     DebugUiCallback m_debugUiDrawCallback = nullptr;
     DebugUiCallback m_debugUiShutdownCallback = nullptr;

@@ -4,12 +4,20 @@
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/gs/gs_frontend.h"
 
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <optional>
 #include <sstream>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -17,6 +25,61 @@ using namespace ps2_syscalls;
 
 namespace
 {
+    std::atomic<bool> s_presentationGuestEntered{false}, s_presentationGuestExited{false};
+
+    void presentationFailureGuest(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        s_presentationGuestEntered.store(true, std::memory_order_release);
+        while (!runtime->isStopRequested())
+            std::this_thread::yield();
+        s_presentationGuestExited.store(true, std::memory_order_release);
+        ctx->pc = 0u;
+    }
+
+    class PresentationFailureBackend final : public GSRasterBackend
+    {
+    public:
+        explicit PresentationFailureBackend(bool failAtSync) : m_failAtSync(failAtSync) {}
+        void Initialize(uint8_t *, uint32_t) override {}
+        void Reset() override {}
+        void Submit(const GSPrimitiveBatch &) override {}
+        void BeginTransfer(const GSTransferCommand &) override {}
+        void UploadImage(const uint8_t *, uint32_t) override {}
+        void Flush() override {}
+        void TextureFlush() override {}
+        void Sync(GSSyncReason reason) override
+        {
+            if (m_failAtSync && reason == GSSyncReason::Presentation)
+            {
+                waitForGuest();
+                throw std::runtime_error("injected delayed GS failure");
+            }
+        }
+        PresentationFrame Present(const GSPresentationRequest &) override
+        {
+            waitForGuest();
+            throw 42; // Exercise the non-std::exception cleanup path too.
+        }
+        bool ClearFramebuffer(const GSContext &, uint32_t) override { return false; }
+        uint32_t ConsumeLocalToHostBytes(uint8_t *, uint32_t) override { return 0u; }
+        uint32_t ReadVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) const override { return 0u; }
+        void WriteVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) override {}
+        void SnapshotVram(std::vector<uint8_t> &out) const override { out.clear(); }
+        GSTransferSnapshot GetTransferSnapshot() const override { return {}; }
+    private:
+        static void waitForGuest()
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!s_presentationGuestEntered.load(std::memory_order_acquire))
+            {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    throw std::runtime_error("presentation test guest did not start");
+                std::this_thread::yield();
+            }
+        }
+        bool m_failAtSync;
+    };
+
     constexpr uint32_t K_PARAM_ADDR = 0x1000u;
     constexpr uint32_t K_STATUS_ADDR = 0x1400u;
 
@@ -115,6 +178,49 @@ namespace
     bool callSyscall(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         return dispatchNumericSyscall(syscallNumber, rdram, ctx, runtime);
+    }
+
+    // A MIPS executable whose one loadable segment, all .bss, spans [base, end).
+    bool writeBssOnlyElf(const std::filesystem::path &path, uint32_t base, uint32_t end)
+    {
+        std::vector<uint8_t> bytes;
+        const auto put16 = [&bytes](uint16_t value)
+        {
+            bytes.push_back(static_cast<uint8_t>(value));
+            bytes.push_back(static_cast<uint8_t>(value >> 8u));
+        };
+        const auto put32 = [&put16](uint32_t value)
+        {
+            put16(static_cast<uint16_t>(value));
+            put16(static_cast<uint16_t>(value >> 16u));
+        };
+        put32(0x464C457Fu); // "\x7FELF"
+        put32(0x00010101u); // 32-bit, little-endian, version 1
+        bytes.resize(16u, 0u);
+        put16(2u);          // ET_EXEC
+        put16(8u);          // EM_MIPS
+        put32(1u);          // version
+        put32(base);        // entry
+        put32(52u);         // program headers right after this header
+        put32(0u);          // no section headers
+        put32(0u);          // flags
+        put16(52u);         // header size
+        put16(32u);         // program header size
+        put16(1u);          // one program header
+        put16(0u);
+        put16(0u);
+        put16(0u);
+        put32(1u);          // PT_LOAD
+        put32(0u);          // offset
+        put32(base);        // vaddr
+        put32(base);        // paddr
+        put32(0u);          // filesz
+        put32(end - base);  // memsz
+        put32(6u);          // read, write
+        put32(0x1000u);     // align
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        file.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        return static_cast<bool>(file);
     }
 
     void overrideReturnHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
@@ -447,6 +553,38 @@ namespace
         runtime->requestStop();
     }
 
+    // A thread deletes itself from its own fiber; a peer then hands its ID to
+    // a new thread.
+    constexpr uint32_t K_EXIT_DELETE = 0x300900u;
+    constexpr uint32_t K_EXIT_DELETE_PEER = 0x300910u;
+    constexpr uint32_t K_EXIT_DELETE_REUSED = 0x300920u;
+    int gExitDeleteId = 0;
+    int gExitDeleteReusedId = 0;
+    bool gExitDeleteRecordGone = false;
+
+    void schedulerExitDelete(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gSchedulerTrace->push_back(10);
+        ExitDeleteThread(rdram, ctx, runtime);
+    }
+
+    void schedulerExitDeletePeer(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &ee = runtime->eeScheduler();
+        gSchedulerTrace->push_back(20);
+        gExitDeleteRecordGone = ee.thread(gExitDeleteId) == nullptr;
+        gExitDeleteReusedId = ee.createThread(EeThreadCreateParams{0, K_EXIT_DELETE_REUSED, 0x22000u, 0x800u, 0, 20, 0});
+        ee.startThread(gExitDeleteReusedId, 0u, *ctx, false);
+        ctx->pc = 0u;
+    }
+
+    void schedulerExitDeleteReused(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gSchedulerTrace->push_back(30);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
     constexpr uint32_t K_EVENT_FIFO_MAIN = 0x301000u;
     constexpr uint32_t K_EVENT_FIFO_A = 0x301010u;
     constexpr uint32_t K_EVENT_FIFO_A_RESUME = 0x301014u;
@@ -532,6 +670,99 @@ namespace
         ctx->pc = 0u;
     }
 
+    // Thread-switch charging: cycles read just before a guest leaves its
+    // thread and just after the next one starts.
+    constexpr uint32_t K_SWITCH_YIELD = 0x300800u;
+    constexpr uint32_t K_SWITCH_YIELD_RESUME = 0x300804u;
+    constexpr uint32_t K_SWITCH_PEER = 0x300810u;
+    constexpr uint32_t K_SWITCH_WAIT = 0x300820u;
+    constexpr uint32_t K_SWITCH_WAIT_RESUME = 0x300824u;
+    constexpr uint32_t K_SWITCH_SIGNAL = 0x300830u;
+    constexpr uint32_t K_SWITCH_EXIT = 0x300840u;
+    constexpr uint32_t K_SWITCH_RESPAWN = 0x300850u;
+    constexpr uint32_t K_SWITCH_REUSED = 0x300860u;
+    uint64_t gSwitchBefore = 0u;
+    uint64_t gSwitchAfter = 0u;
+    int gSwitchSemaphore = 0;
+    int gSwitchReusedId = 0;
+
+    void queueSwitchInvocation(PS2Runtime *runtime, uint32_t pc, uint32_t a0)
+    {
+        GuestInvocation invocation{};
+        invocation.kind = GuestInvocationKind::Interrupt;
+        invocation.context.pc = pc;
+        SET_GPR_U32(&invocation.context, 4, a0);
+        runtime->eeScheduler().queueInvocation(std::move(invocation));
+    }
+
+    void switchYield(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gSwitchBefore = runtime->eeScheduler().eeCycle();
+        ctx->pc = K_SWITCH_YIELD_RESUME;
+        SET_GPR_U32(ctx, 4, 5u);
+        RotateThreadReadyQueue(rdram, ctx, runtime);
+    }
+
+    void switchYieldResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void switchPeer(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gSwitchAfter = runtime->eeScheduler().eeCycle();
+        ctx->pc = 0u;
+    }
+
+    void switchWait(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        queueSwitchInvocation(runtime, K_SWITCH_SIGNAL, static_cast<uint32_t>(gSwitchSemaphore));
+        gSwitchBefore = runtime->eeScheduler().eeCycle();
+        ctx->pc = K_SWITCH_WAIT_RESUME;
+        SET_GPR_U32(ctx, 4, static_cast<uint32_t>(gSwitchSemaphore));
+        WaitSema(rdram, ctx, runtime);
+    }
+
+    void switchWaitResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gSwitchAfter = runtime->eeScheduler().eeCycle();
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void switchSignal(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        iSignalSema(rdram, ctx, runtime);
+        ctx->pc = 0u;
+    }
+
+    void switchExit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        queueSwitchInvocation(runtime, K_SWITCH_RESPAWN,
+                              static_cast<uint32_t>(runtime->eeScheduler().currentThreadId()));
+        ExitThread(rdram, ctx, runtime);
+    }
+
+    // Deletes the exited thread, then hands its ID to a new one.
+    void switchRespawn(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &ee = runtime->eeScheduler();
+        uint32_t ownedStack = 0u;
+        ee.deleteThread(getRegS32(*ctx, 4), ownedStack);
+        gSwitchReusedId = ee.createThread(EeThreadCreateParams{0, K_SWITCH_REUSED, 0x22000u, 0x800u, 0, 5, 0});
+        ee.startThread(gSwitchReusedId, 0u, *ctx, true);
+        gSwitchBefore = ee.eeCycle();
+        ctx->pc = 0u;
+    }
+
+    void switchReused(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gSwitchAfter = runtime->eeScheduler().eeCycle();
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
     struct TestEnv
     {
         std::vector<uint8_t> rdram;
@@ -549,27 +780,48 @@ void register_ps2_runtime_kernel_tests()
 {
     MiniTest::Case("PS2RuntimeKernel", [](TestCase &tc)
     {
-        tc.Run("unsigned loads and ABI word writes extend independently", [](TestCase &t)
+        tc.Run("Host presentation failures stop and join the actual guest thread", [](TestCase &t)
         {
-            constexpr uint64_t kUpper = 0x1122334455667788ull;
-            R5900Context ctx{};
-            ctx.r[2] = _mm_set_epi64x(static_cast<int64_t>(kUpper), 0);
+            for (const bool failAtSync : {true, false})
+            {
+                auto runtime = std::make_unique<PS2Runtime>();
+                t.IsTrue(runtime->memory().initialize(), "test memory initializes without a window");
+                runtime->gs().init(runtime->memory().getGSVRAM(), PS2_GS_VRAM_SIZE, &runtime->memory().gs());
+                runtime->gs().setRasterBackend(std::make_unique<PresentationFailureBackend>(failAtSync));
+                runtime->setExternalPresenter([](void *) { return true; }, nullptr);
+                constexpr uint32_t entry = 0x27000u;
+                runtime->registerFunction(entry, presentationFailureGuest);
+                runtime->cpu().pc = entry;
+                s_presentationGuestEntered.store(false, std::memory_order_relaxed);
+                s_presentationGuestExited.store(false, std::memory_order_relaxed);
+                runtime->run();
+                t.IsTrue(runtime->isStopRequested(), "presentation failure requests stop");
+                t.IsTrue(s_presentationGuestEntered.load(std::memory_order_acquire), "guest was running when presentation failed");
+                t.IsTrue(s_presentationGuestExited.load(std::memory_order_acquire), "run returned only after the guest exited");
+                runtime->replaceFunction(entry, nullptr);
+            }
+        });
 
-            SET_GPR_ZE32(&ctx, 2, 0x80000000u);
-            t.Equals(static_cast<uint64_t>(_mm_extract_epi64(ctx.r[2], 0)),
-                     0x0000000080000000ull,
-                     "SET_GPR_ZE32 must zero-extend values used by LWU/LHU/LBU");
-            t.Equals(static_cast<uint64_t>(_mm_extract_epi64(ctx.r[2], 1)),
-                     kUpper,
-                     "SET_GPR_ZE32 must preserve the upper 64 bits of the 128-bit GPR");
-
-            SET_GPR_U32(&ctx, 2, 0x80000000u);
-            t.Equals(static_cast<uint64_t>(_mm_extract_epi64(ctx.r[2], 0)),
-                     0xFFFFFFFF80000000ull,
-                     "SET_GPR_U32 must retain the existing EE 32-bit ABI extension semantics");
-            t.Equals(static_cast<uint64_t>(_mm_extract_epi64(ctx.r[2], 1)),
-                     kUpper,
-                     "SET_GPR_U32 must preserve the upper 64 bits of the 128-bit GPR");
+        tc.Run("syscall lookup observes replacement, removal and runtime reuse", [](TestCase &t)
+        {
+            std::optional<PS2Runtime> runtime(std::in_place);
+            uint32_t handler = 0u;
+            constexpr uint32_t number = 0x2Bu;
+            t.IsTrue(!runtime->findEeSyscallOverride(number, handler), "no initial override");
+            runtime->setEeSyscallOverride(nullptr, number, 0x1000u);
+            t.IsTrue(runtime->findEeSyscallOverride(number, handler), "new override replaces cached miss");
+            t.Equals(handler, 0x1000u, "installed handler is visible");
+            std::thread writer([&] { runtime->setEeSyscallOverride(nullptr, number, 0x2000u); });
+            writer.join();
+            t.IsTrue(runtime->findEeSyscallOverride(number, handler), "cross-thread replacement is visible");
+            t.Equals(handler, 0x2000u, "replacement invalidates cached hit");
+            runtime->setEeSyscallOverride(nullptr, number, 0u);
+            t.IsTrue(!runtime->findEeSyscallOverride(number, handler), "removal invalidates cached hit");
+            runtime->setEeSyscallOverride(nullptr, number, 0x3000u);
+            runtime->findEeSyscallOverride(number, handler);
+            runtime.reset();
+            runtime.emplace();
+            t.IsTrue(!runtime->findEeSyscallOverride(number, handler), "reused runtime address has no old override");
         });
 
         tc.Run("CreateThread and CreateSema decode the exact PS2SDK EE layouts", [](TestCase &t)
@@ -833,6 +1085,151 @@ void register_ps2_runtime_kernel_tests()
             t.IsTrue(trace == expected, "explicit rotation should move the current head behind its FIFO peer");
         });
 
+        tc.Run("rotating a singleton does not run a lower-priority thread", [](TestCase &t)
+        {
+            for (const bool withLower : {false, true})
+            {
+                TestEnv env;
+                std::vector<int> trace;
+                gSchedulerTrace = &trace;
+                env.runtime.registerFunction(K_SCHED_MAIN, schedulerMainExit);
+                env.runtime.registerFunction(K_SCHED_A, schedulerRotateA);
+                env.runtime.registerFunction(K_SCHED_A_RESUME, schedulerRotateAResume);
+                env.runtime.registerFunction(K_SCHED_B, schedulerTraceB);
+                env.ctx.pc = K_SCHED_MAIN;
+                EeScheduler &ee = env.runtime.eeScheduler();
+                ee.reset(env.rdram.data(), env.ctx);
+                const int first = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x20000u, 0x800u, 0, 5, 0});
+                ee.startThread(first, 0, env.ctx, false);
+                if (withLower)
+                {
+                    const int lower = ee.createThread(EeThreadCreateParams{0, K_SCHED_B, 0x21000u, 0x800u, 0, 20, 0});
+                    ee.startThread(lower, 0, env.ctx, false);
+                }
+                ee.run();
+                t.IsTrue(trace == std::vector<int>({1, 10, 11}), "the rotating thread retains its priority");
+            }
+        });
+
+        tc.Run("a switch to another guest thread costs kThreadSwitchCycles", [](TestCase &t)
+        {
+            TestEnv env;
+            std::vector<int> trace;
+            gSchedulerTrace = &trace;
+            env.runtime.registerFunction(K_SCHED_MAIN, schedulerMainExit);
+            env.runtime.registerFunction(K_SWITCH_YIELD, switchYield);
+            env.runtime.registerFunction(K_SWITCH_YIELD_RESUME, switchYieldResume);
+            env.runtime.registerFunction(K_SWITCH_PEER, switchPeer);
+            env.ctx.pc = K_SCHED_MAIN;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            const int yielding = ee.createThread(EeThreadCreateParams{0, K_SWITCH_YIELD, 0x20000u, 0x800u, 0, 5, 0});
+            const int peer = ee.createThread(EeThreadCreateParams{0, K_SWITCH_PEER, 0x21000u, 0x800u, 0, 5, 0});
+            ee.startThread(yielding, 0, env.ctx, false);
+            ee.startThread(peer, 0, env.ctx, false);
+            ee.run();
+            t.Equals(gSwitchAfter - gSwitchBefore,
+                     uint64_t{EeScheduler::kThreadSwitchCycles + EeScheduler::kGuestDispatchCycles},
+                     "yielding to a peer charges the switch on top of the peer's dispatch");
+        });
+
+        tc.Run("an interrupt between two turns of one thread is not a switch", [](TestCase &t)
+        {
+            TestEnv env;
+            std::vector<int> trace;
+            gSchedulerTrace = &trace;
+            env.runtime.registerFunction(K_SCHED_MAIN, schedulerMainExit);
+            env.runtime.registerFunction(K_SWITCH_WAIT, switchWait);
+            env.runtime.registerFunction(K_SWITCH_WAIT_RESUME, switchWaitResume);
+            env.runtime.registerFunction(K_SWITCH_SIGNAL, switchSignal);
+            env.ctx.pc = K_SCHED_MAIN;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            gSwitchSemaphore = ee.createSemaphore(0, 1, 0u, 0u);
+            const int waiting = ee.createThread(EeThreadCreateParams{0, K_SWITCH_WAIT, 0x20000u, 0x800u, 0, 5, 0});
+            ee.startThread(waiting, 0, env.ctx, false);
+            gSwitchAfter = 0u;
+            ee.run();
+            t.IsTrue(gSwitchAfter > gSwitchBefore, "the waiting thread resumes after the interrupt signals it");
+            t.IsTrue(gSwitchAfter - gSwitchBefore < EeScheduler::kThreadSwitchCycles,
+                     "the handler and the same thread's return are charged no switch");
+        });
+
+        tc.Run("a new thread reusing the last-run thread's ID still costs a switch", [](TestCase &t)
+        {
+            TestEnv env;
+            std::vector<int> trace;
+            gSchedulerTrace = &trace;
+            env.runtime.registerFunction(K_SCHED_MAIN, schedulerMainExit);
+            env.runtime.registerFunction(K_SWITCH_EXIT, switchExit);
+            env.runtime.registerFunction(K_SWITCH_RESPAWN, switchRespawn);
+            env.runtime.registerFunction(K_SWITCH_REUSED, switchReused);
+            env.runtime.registerFunction(K_SCHED_B, schedulerTraceB);
+            env.ctx.pc = K_SCHED_MAIN;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            const int exiting = ee.createThread(EeThreadCreateParams{0, K_SWITCH_EXIT, 0x20000u, 0x800u, 0, 5, 0});
+            // Take every other ID so the respawned thread is given the exiting one's.
+            for (int id = exiting + 1; id <= EeScheduler::kLastThreadId; ++id)
+                ee.createThread(EeThreadCreateParams{0, K_SCHED_B, 0x21000u, 0x800u, 0, 5, 0});
+            ee.startThread(exiting, 0, env.ctx, false);
+            gSwitchReusedId = 0;
+            gSwitchAfter = 0u;
+            ee.run();
+            t.Equals(gSwitchReusedId, exiting, "the respawned thread reuses the deleted thread's ID");
+            t.IsTrue(gSwitchAfter >= gSwitchBefore + EeScheduler::kThreadSwitchCycles,
+                     "a deleted thread's ID does not make its successor look like a re-entry");
+        });
+
+        tc.Run("thread lookup follows ID reuse and scheduler reset", [](TestCase &t)
+        {
+            TestEnv env;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            for (int i = 0; i < 2 * EeScheduler::kLastThreadId; ++i)
+            {
+                const int id = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x20000u, 0x800u, 0, 5, 0});
+                t.IsTrue(ee.thread(id) != nullptr, "new and reused IDs resolve");
+                uint32_t ownedStack = 0u;
+                t.Equals(ee.deleteThread(id, ownedStack), KE_OK, "dormant thread deletes");
+                t.IsTrue(ee.thread(id) == nullptr, "deleted ID does not retain its old node");
+            }
+            const int last = ee.createThread(EeThreadCreateParams{0, K_SCHED_B, 0x21000u, 0x800u, 0, 5, 0});
+            ee.reset(env.rdram.data(), env.ctx);
+            t.IsTrue(ee.thread(last) == nullptr, "reset clears all indexed threads");
+            t.IsTrue(ee.thread(EeScheduler::kMainThreadId) != nullptr, "reset installs the main thread");
+        });
+
+        tc.Run("a thread deleting itself with ExitDeleteThread leaves the scheduler running", [](TestCase &t)
+        {
+            TestEnv env;
+            std::vector<int> trace;
+            gSchedulerTrace = &trace;
+            env.runtime.registerFunction(K_SCHED_MAIN, schedulerMainExit);
+            env.runtime.registerFunction(K_EXIT_DELETE, schedulerExitDelete);
+            env.runtime.registerFunction(K_EXIT_DELETE_PEER, schedulerExitDeletePeer);
+            env.runtime.registerFunction(K_EXIT_DELETE_REUSED, schedulerExitDeleteReused);
+            env.ctx.pc = K_SCHED_MAIN;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            gExitDeleteId = ee.createThread(EeThreadCreateParams{0, K_EXIT_DELETE, 0x20000u, 0x800u, 0, 5, 0});
+            const int peer = ee.createThread(EeThreadCreateParams{0, K_EXIT_DELETE_PEER, 0x21000u, 0x800u, 0, 20, 0});
+            // Take every other ID so the peer's new thread is given the deleted one's.
+            while (ee.createThread(EeThreadCreateParams{0, K_SCHED_B, 0x23000u, 0x800u, 0, 20, 0}) > 0)
+            {
+            }
+            ee.startThread(gExitDeleteId, 0, env.ctx, false);
+            ee.startThread(peer, 0, env.ctx, false);
+            gExitDeleteRecordGone = false;
+            gExitDeleteReusedId = 0;
+            ee.run();
+
+            t.IsTrue(trace == std::vector<int>({1, 10, 20, 30}),
+                     "the peer and the thread reusing the ID run after the exit");
+            t.IsTrue(gExitDeleteRecordGone, "ExitDeleteThread removes the thread's record");
+            t.Equals(gExitDeleteReusedId, gExitDeleteId, "the deleted thread's ID can be reused");
+        });
+
         tc.Run("starting a strictly higher-priority thread preempts immediately", [](TestCase &t)
         {
             TestEnv env;
@@ -1000,7 +1397,43 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(getRegS32(env.ctx, 2), -4, "__divdi3 should divide signed 64-bit values");
         });
 
-        tc.Run("ReleaseAlarm aliases CancelAlarm and cache syscalls succeed", [](TestCase &t)
+        tc.Run("libm double stubs take $a0 and return in $v0", [](TestCase &t)
+        {
+            // EE GCC has no double-precision FPU: a double travels whole in one GPR.
+            const auto bits = [](double v)
+            {
+                uint64_t b = 0;
+                std::memcpy(&b, &v, sizeof(b));
+                return b;
+            };
+            struct Case
+            {
+                void (*fn)(uint8_t *, R5900Context *, PS2Runtime *);
+                double in;
+                double out;
+                const char *name;
+            };
+            const Case cases[] = {
+                {ps2_stubs::sin, 0.5, std::sin(0.5), "sin"},
+                {ps2_stubs::cos, 0.5, std::cos(0.5), "cos"},
+                {ps2_stubs::tan, 0.25, std::tan(0.25), "tan"},
+                {ps2_stubs::atan, 1.0, std::atan(1.0), "atan"},
+                {ps2_stubs::floor, -1.5, -2.0, "floor"},
+                {ps2_stubs::fabs, -2.25, 2.25, "fabs"},
+            };
+            for (const Case &c : cases)
+            {
+                TestEnv env;
+                R5900Context *ctx = &env.ctx;
+                SET_GPR_U64(ctx, 4, bits(c.in));
+                ctx->f[12] = 99.0f; // a stale single-precision argument must be ignored
+                c.fn(env.rdram.data(), ctx, &env.runtime);
+                t.Equals(GPR_U64(ctx, 2), bits(c.out),
+                         std::string(c.name) + " should read the double in $a0 and return it in $v0");
+            }
+        });
+
+        tc.Run("ReleaseAlarm aliases CancelAlarm and cache toggles succeed", [](TestCase &t)
         {
             TestEnv env;
 
@@ -1028,13 +1461,6 @@ void register_ps2_runtime_kernel_tests()
 
             DisableCache(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "DisableCache should succeed as a no-op");
-
-            setRegU32(env.ctx, 2, 0xDEADBEEFu);
-            setRegU32(env.ctx, 4, 0u); // PS2SDK WRITEBACK_DCACHE
-            t.IsTrue(callSyscall(static_cast<uint32_t>(-0x68), env.rdram.data(), &env.ctx, &env.runtime),
-                     "-0x68 should dispatch iFlushCache");
-            t.Equals(getRegS32(env.ctx, 2), KE_OK,
-                     "iFlushCache should succeed when guest and host memory are coherent");
         });
 
         tc.Run("setup heap and thread invalid ids use documented kernel errors", [](TestCase &t)
@@ -1094,12 +1520,12 @@ void register_ps2_runtime_kernel_tests()
             setRegU32(env.ctx, 6, kMainStackSize);
             t.IsTrue(callSyscall(0x3Cu, env.rdram.data(), &env.ctx, &env.runtime),
                      "SetupThread syscall should dispatch");
-            t.Equals(::getRegU32(&env.ctx, 2), kExpectedStack,
-                     "automatic main stack should start below the reserved top-of-RDRAM area");
+            t.Equals(::getRegU32(&env.ctx, 2), PS2_RAM_SIZE,
+                     "automatic main stack should grow down from the top of RDRAM through the area it reserves");
 
             // ReferThreadStatus can be called after many nested frames have moved $sp.
             // It must report the initial stack recorded by SetupThread, not this live snapshot.
-            constexpr uint32_t kTransientSp = kExpectedStack - 0x80u;
+            constexpr uint32_t kTransientSp = PS2_RAM_SIZE - 0x80u;
             setRegU32(env.ctx, 29, kTransientSp);
             setRegU32(env.ctx, 4, 0u);
             setRegU32(env.ctx, 5, K_STATUS_ADDR);
@@ -1117,6 +1543,57 @@ void register_ps2_runtime_kernel_tests()
                      "main thread status must preserve SetupThread's global pointer");
             t.IsTrue(status.stack != kInitialLoaderSp && status.stack != kTransientSp,
                      "main thread status must never expose a live stack-pointer snapshot");
+        });
+
+        tc.Run("SetupThread's automatic stack shares no memory with invocation stacks", [](TestCase &t)
+        {
+            struct Layout
+            {
+                const char *name;
+                uint32_t stackSize;
+                uint32_t imageEnd; // 0 when no ELF is loaded
+            };
+            // DQ8's crt0 asks for 0xC0000. An area down to the guest heap limit
+            // leaves the pool no room under it, and so does an image that fills
+            // RAM up to where the kernel puts the area, 4 KB under the end of RAM.
+            constexpr uint32_t kSmallStack = 0x00010000u;
+            const Layout layouts[] = {
+                {"DQ8's stack", 0x000C0000u, 0u},
+                {"a stack down to the guest heap limit", 0x00100000u, 0u},
+                {"an image up to the stack", kSmallStack, PS2_RAM_SIZE - 0x1000u - kSmallStack},
+            };
+            for (const Layout &layout : layouts)
+            {
+                TestEnv env;
+                if (layout.imageEnd != 0u)
+                {
+                    const PS2Runtime::IoPaths ioPaths = PS2Runtime::getIoPaths();
+                    const std::filesystem::path elf =
+                        std::filesystem::temp_directory_path() / "ps2x_setup_thread_image.elf";
+                    t.IsTrue(writeBssOnlyElf(elf, 0x00100000u, layout.imageEnd), "test ELF should be written");
+                    t.IsTrue(env.runtime.memory().initialize(), "test memory initializes without a window");
+                    t.IsTrue(env.runtime.loadELF(elf.string()), "test ELF should load");
+                    PS2Runtime::setIoPaths(ioPaths);
+                    std::error_code error;
+                    std::filesystem::remove(elf, error);
+                }
+                env.ctx.pc = 0x00100000u;
+                setRegU32(env.ctx, 29, PS2_RAM_SIZE - 0x10u);
+                setRegU32(env.ctx, 4, 0u);
+                setRegU32(env.ctx, 5, 0xFFFFFFFFu);
+                setRegU32(env.ctx, 6, layout.stackSize);
+                t.IsTrue(callSyscall(0x3Cu, env.rdram.data(), &env.ctx, &env.runtime),
+                         "SetupThread syscall should dispatch");
+                const uint32_t mainSp = ::getRegU32(&env.ctx, 2);
+
+                // VBlank handlers and movie callbacks taken now run on this
+                // 16 KB stack, the first one the pool hands out.
+                const uint32_t invocationEnd = env.runtime.eeScheduler().invocationStackTop() + 0x10u;
+                const uint32_t invocationBase = invocationEnd - 0x4000u;
+                t.IsTrue(invocationEnd <= mainSp - layout.stackSize || invocationBase >= mainSp,
+                         std::string("invocation stacks must stay out of everything the main thread's stack "
+                                     "can reach, with ") + layout.name);
+            }
         });
 
         tc.Run("OSD config2 syscalls round-trip extended config", [](TestCase &t)

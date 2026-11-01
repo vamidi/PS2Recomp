@@ -2,18 +2,23 @@
 #include "runtime/gs/gs_cpu_backend.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_pad_host.h"
+
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
+#include <string>
 
 namespace
 {
-    static constexpr uint32_t kHostFrameWidth = 640u;
-
     GSPrimReg decodePrimRegister(uint64_t value)
     {
         GSPrimReg prim{};
@@ -125,6 +130,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 void GS::reset()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
     std::memset(m_ctx, 0, sizeof(m_ctx));
     m_prim = {};
     m_primRegister = {};
@@ -170,6 +176,7 @@ void GS::reset()
         m_hostPresentationFrame.clear();
         m_hostPresentationWidth = 0u;
         m_hostPresentationHeight = 0u;
+        m_hostPresentationRowPitchBytes = 0u;
         m_hostPresentationDisplayFbp = 0u;
         m_hostPresentationSourceFbp = 0u;
         m_hostPresentationUsedPreferred = false;
@@ -524,9 +531,13 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     return request;
 }
 
+static void maybeWriteScreenshot(GS &gs);
+
 void GS::latchHostPresentationFrame()
 {
     GSPresentationRequest request{};
+    GSPresentationTicket ticket;
+    std::unique_lock<std::mutex> backendLock(m_backendLifetimeMutex, std::defer_lock);
     {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
         if (!m_backend || !m_privRegs)
@@ -535,44 +546,134 @@ void GS::latchHostPresentationFrame()
             m_hostPresentationFrame.clear();
             m_hasHostPresentationFrame = false;
             m_hostPresentationWidth = m_hostPresentationHeight = 0u;
+            m_hostPresentationRowPitchBytes = 0u;
             return;
         }
+        backendLock.lock();
         request = buildPresentationRequestUnlocked();
+        if (m_backend->QueuesPreparedPresentation())
+            ticket = m_backend->PreparePresentation(request);
     }
 
     PresentationFrame frame{};
+    if (ticket)
+        frame = m_backend->DisplayPreparedPresentation(ticket);
+    else
     {
-        std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
-        if (m_backend)
-        {
-            m_backend->Flush();
-            m_backend->Sync(GSSyncReason::Presentation);
-            frame = m_backend->Present(request);
-        }
+        m_backend->Flush();
+        m_backend->Sync(GSSyncReason::Presentation);
+        frame = m_backend->Present(request);
     }
 
-    const bool hasFrame = static_cast<bool>(frame);
+    const bool presented = static_cast<bool>(frame);
+    const bool hasHostFrame = presented && frame.mode == GSPresentationMode::HostPixels;
     const uint32_t displayFbp = frame.displayFbp;
     const uint32_t sourceFbp = frame.sourceFbp;
     const uint32_t width = frame.width;
     const uint32_t height = frame.height;
+    uint32_t rowPitchBytes = frame.rowPitchBytes;
+    if (rowPitchBytes == 0u && width <= std::numeric_limits<uint32_t>::max() / 4u)
+        rowPitchBytes = width * 4u;
     const bool usedPreferred = frame.usedPreferred;
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
-        m_hostPresentationFrame = std::move(frame.pixels);
-        m_hostPresentationWidth = width;
-        m_hostPresentationHeight = height;
+        if (hasHostFrame)
+            m_hostPresentationFrame = std::move(frame.pixels);
+        else
+            m_hostPresentationFrame.clear();
+        m_hostPresentationWidth = hasHostFrame ? width : 0u;
+        m_hostPresentationHeight = hasHostFrame ? height : 0u;
+        m_hostPresentationRowPitchBytes = hasHostFrame ? rowPitchBytes : 0u;
         m_hostPresentationDisplayFbp = displayFbp;
         m_hostPresentationSourceFbp = sourceFbp;
         m_hostPresentationUsedPreferred = usedPreferred;
-        m_hasHostPresentationFrame = hasFrame;
+        m_hasHostPresentationFrame = hasHostFrame;
+    }
+    ticket.reset();
+    backendLock.unlock();
+
+    if (hasHostFrame)
+    {
+        maybeWriteScreenshot(*this);
     }
 
-    if (hasFrame)
+    if (presented)
     {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
         recordPresentDebugEventUnlocked(displayFbp, sourceFbp, width, height, usedPreferred);
     }
+}
+
+// DQ8_GFX_SCREENSHOT_DIR + DQ8_GFX_SCREENSHOT_EVERY=N dump the presented frame
+// as a binary PPM every N frames. PPM keeps this dependency-free; convert with
+// `ffmpeg -i shot.ppm shot.png` when a viewer is wanted. A backend that presents
+// natively skips the CPU compose, so it disables that fast path while this is on.
+//
+// A free function on purpose: gs_frontend.h reaches the whole recompiled corpus
+// through ps2_runtime.h, so declaring this on GS would cost a full rebuild.
+static void maybeWriteScreenshot(GS &gs)
+{
+    struct Config
+    {
+        std::string directory;
+        uint64_t every = 0u;
+    };
+    static const Config config = [] {
+        Config parsed{};
+        const char *dir = std::getenv("DQ8_GFX_SCREENSHOT_DIR");
+        if (dir == nullptr || *dir == '\0')
+        {
+            return parsed;
+        }
+        parsed.directory = dir;
+        const char *every = std::getenv("DQ8_GFX_SCREENSHOT_EVERY");
+        const long long value = every ? std::atoll(every) : 0;
+        parsed.every = value > 0 ? static_cast<uint64_t>(value) : 60ull;
+        return parsed;
+    }();
+    if (config.every == 0u)
+    {
+        return;
+    }
+
+    // Named by guest vsync tick, the same clock DQ8_PAD_SCRIPT uses, so a
+    // screenshot tells you directly which frame to script an input at.
+    const uint64_t frame = ps2PadCurrentGuestFrame();
+    static uint64_t s_lastWritten = std::numeric_limits<uint64_t>::max();
+    if (s_lastWritten != std::numeric_limits<uint64_t>::max() &&
+        frame < s_lastWritten + config.every)
+    {
+        return;
+    }
+    s_lastWritten = frame;
+
+    std::vector<uint8_t> pixels;
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    if (!gs.copyLatchedHostPresentationFrame(pixels, width, height, nullptr, nullptr, nullptr) ||
+        width == 0u || height == 0u)
+    {
+        return;
+    }
+
+    char path[512];
+    std::snprintf(path, sizeof(path), "%s/frame_%06llu.ppm", config.directory.c_str(),
+                  static_cast<unsigned long long>(frame));
+    std::ofstream out(path, std::ios::binary);
+    if (!out)
+    {
+        return;
+    }
+    out << "P6\n" << width << " " << height << "\n255\n";
+    // copyLatchedHostPresentationFrame hands back tightly packed RGBA.
+    std::vector<uint8_t> rgb(static_cast<size_t>(width) * height * 3u);
+    for (size_t i = 0u, n = static_cast<size_t>(width) * height; i < n; ++i)
+    {
+        rgb[i * 3u + 0u] = pixels[i * 4u + 0u];
+        rgb[i * 3u + 1u] = pixels[i * 4u + 1u];
+        rgb[i * 3u + 2u] = pixels[i * 4u + 2u];
+    }
+    out.write(reinterpret_cast<const char *>(rgb.data()), static_cast<std::streamsize>(rgb.size()));
 }
 
 bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
@@ -610,7 +711,20 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
     if (outWidth != 0u && outHeight != 0u)
     {
-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
+        const size_t sourceRowBytes = m_hostPresentationRowPitchBytes;
+        if (sourceRowBytes < packedRowBytes)
+        {
+            outPixels.clear();
+            outWidth = 0u;
+            outHeight = 0u;
+            if (outDisplayFbp)
+                *outDisplayFbp = 0u;
+            if (outSourceFbp)
+                *outSourceFbp = 0u;
+            if (outUsedPreferred)
+                *outUsedPreferred = false;
+            return false;
+        }
         for (uint32_t y = 0; y < outHeight; ++y)
         {
             const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
@@ -638,8 +752,41 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
+// Debug accounting: total time decoding GIF packets, and how many arrived.
+// A backend can subtract its own time from this to see what packet decoding
+// costs on its own, which is the difference between "the renderer is slow" and
+// "the game is sending an enormous number of tiny packets".
+std::atomic<uint64_t> g_gsFrontendPacketNanos{0};
+std::atomic<uint64_t> g_gsFrontendPacketCount{0};
+// Off unless a backend reports the numbers: the field sends over ten thousand
+// packets a frame, and two clock reads each add up.
+std::atomic<bool> g_gsFrontendTiming{false};
+// The same for the native image-upload fast path, which bypasses
+// processGIFPacket entirely -- DQ8's movie tiles arrive this way, one DMA
+// chain per 16x16 tile, so without a separate counter they are invisible.
+std::atomic<uint64_t> g_gsUploadNativeNanos{0};
+std::atomic<uint64_t> g_gsUploadNativeCount{0};
+
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    struct PacketTimer
+    {
+        bool timed = g_gsFrontendTiming.load(std::memory_order_relaxed);
+        std::chrono::steady_clock::time_point start =
+            timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ~PacketTimer()
+        {
+            if (!timed)
+                return;
+            g_gsFrontendPacketNanos.fetch_add(
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - start)
+                                          .count()),
+                std::memory_order_relaxed);
+            g_gsFrontendPacketCount.fetch_add(1, std::memory_order_relaxed);
+        }
+    } packetTimer;
+
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
@@ -725,9 +872,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             if ((nloop * nreg) & 1)
                 offset += 8;
         }
-        else if (flg == GIF_FMT_IMAGE || flg == GIF_FMT_DISABLED)
+        else if (flg == GIF_FMT_IMAGE)
         {
-            // FLG=3 ("disabled" in the GS manual) behaves exactly like IMAGE: NLOOP qwords of image data.
             uint32_t imageBytes = nloop * 16;
             if (offset + imageBytes > sizeBytes)
                 imageBytes = sizeBytes - offset;
@@ -784,8 +930,17 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            const uint8_t *data,
                            uint32_t sizeBytes)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+    const auto start = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+    }
+    g_gsUploadNativeNanos.fetch_add(
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - start)
+                                  .count()),
+        std::memory_order_relaxed);
+    g_gsUploadNativeCount.fetch_add(1, std::memory_order_relaxed);
 }
 
 void GS::uploadImageNativeUnlocked(uint64_t bitbltbuf,
@@ -1240,7 +1395,6 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
-        m_backend->LoadClut(t, m_texclut);
         break;
     }
     case GS_REG_CLAMP_1:
@@ -1271,7 +1425,6 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
-        m_backend->LoadClut(t, m_texclut);
         break;
     }
     case GS_REG_XYOFFSET_1:

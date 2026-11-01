@@ -135,9 +135,18 @@ namespace ps2recomp
 
         for (const auto &inst : instructions)
         {
-            // A guest-installed syscall handler runs as a separate invocation,
-            // so the scheduler resumes this thread at syscall+4 and needs an
-            // entry point there. +4, not +8: syscall has no delay slot.
+            // A syscall can hand control back to the scheduler before the
+            // instruction after it runs: SetSyscall lets the guest install its
+            // own handler, and dispatchSyscallOverride then suspends the
+            // calling thread and queues that handler as a GuestInvocation. When
+            // the invocation completes, the scheduler resumes the parent thread
+            // at the address the generated code stored before calling
+            // handleSyscall -- i.e. right here. Without an entry point there,
+            // EeScheduler's hasFunction() check fails and the thread is made
+            // dormant instead of resumed.
+            //
+            // Note the offset is +4, not the +8 used for JAL/JALR: syscall has
+            // no delay slot.
             if (inst.opcode == OPCODE_SPECIAL && inst.function == SPECIAL_SYSCALL)
             {
                 queueResumeEntryTarget(inst.address + 4u);
@@ -393,7 +402,14 @@ namespace ps2recomp
                         }
                     }
                 }
-                if (!foundTable)
+                // Only an unresolved computed *jump* can land on an arbitrary
+                // instruction of this function and therefore force every address to
+                // become an entry point. JALR is a call: it transfers control to
+                // another function and comes back to the instruction after the delay
+                // slot, which is already queued as a resume target above. Treating a
+                // call like a jump here promotes the whole function for what is
+                // usually just a function pointer or virtual dispatch.
+                if (!foundTable && jrInst->function != SPECIAL_JALR)
                 {
                     needsIndirectFallback = true;
                 }

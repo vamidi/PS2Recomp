@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
+#include "runtime/ps2_native_iop.h"
 
 namespace ps2_syscalls
 {
@@ -155,22 +156,20 @@ namespace ps2_syscalls
         const int32_t moduleId = static_cast<int32_t>(getRegU32(ctx, 4)); // $a0
         const uint32_t resultAddr = getRegU32(ctx, 7);                    // $a3 (int* result, optional)
 
-        int32_t moduleResult = -1;
-        const bool stoppedByEmulator = runtime->stopIopModule(moduleId, &moduleResult);
         uint32_t refsLeft = 0;
         const bool knownModule = trackSifModuleStop(moduleId, &refsLeft);
-        const int32_t ret = (stoppedByEmulator || knownModule) ? 0 : -1;
+        const int32_t ret = knownModule ? 0 : -1;
 
         if (resultAddr != 0)
         {
             int32_t *hostResult = reinterpret_cast<int32_t *>(getMemPtr(rdram, resultAddr));
             if (hostResult)
             {
-                *hostResult = stoppedByEmulator ? moduleResult : (knownModule ? 0 : -1);
+                *hostResult = knownModule ? 0 : -1;
             }
         }
 
-        if (stoppedByEmulator || knownModule)
+        if (knownModule)
         {
             std::string modulePath;
             {
@@ -181,7 +180,7 @@ namespace ps2_syscalls
                     modulePath = it->second.path;
                 }
             }
-            logSifModuleAction(stoppedByEmulator ? "stop-emulated" : "stop", moduleId, modulePath, refsLeft);
+            logSifModuleAction("stop", moduleId, modulePath, refsLeft);
         }
 
         setReturnS32(ctx, ret);
@@ -189,45 +188,53 @@ namespace ps2_syscalls
 
     void SifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t pathAddr = getRegU32(ctx, 4);     // $a0
-        const uint32_t argumentSize = getRegU32(ctx, 5); // $a1
-        const uint32_t argumentAddr = getRegU32(ctx, 6); // $a2
+        const uint32_t pathAddr = getRegU32(ctx, 4); // $a0
         const std::string modulePath = readGuestCStringBounded(rdram, pathAddr, kMaxSifModulePathBytes);
         if (modulePath.empty())
         {
             setReturnS32(ctx, -1);
             return;
         }
+        // A module the game runs natively also loads onto the emulated IOP.
+        // The tracker below still hands out the id the game sees.
+        if (ps2x::iop::NativeIop *native = PS2IopTransport::native(runtime); native && native->claims(modulePath))
+        {
+            const uint32_t argLength = std::min<uint32_t>(getRegU32(ctx, 5), 512u);
+            std::string arguments(argLength, '\0');
+            for (uint32_t i = 0; i < argLength; ++i)
+            {
+                if (const uint8_t *byte = getConstMemPtr(rdram, getRegU32(ctx, 6) + i))
+                    arguments[i] = static_cast<char>(*byte);
+            }
+            if (native->load(modulePath, arguments) > 0)
+                ps2_native_iop::startAudio(*runtime);
+        }
 
-        std::vector<uint8_t> arguments;
-        constexpr uint32_t kMaxIopModuleArguments = 64u * 1024u;
-        if (!copyGuestBytesBounded(rdram, argumentAddr, argumentSize, kMaxIopModuleArguments, arguments))
+        const int32_t moduleId = trackSifModuleLoad(modulePath);
+        if (moduleId <= 0)
         {
             setReturnS32(ctx, -1);
             return;
         }
 
-        if (!runtime)
+        uint32_t refs = 0;
         {
-            setReturnS32(ctx, -1);
-            return;
+            std::lock_guard<std::mutex> lock(g_sif_module_mutex);
+            auto it = g_sif_modules_by_id.find(moduleId);
+            if (it != g_sif_modules_by_id.end())
+            {
+                refs = it->second.refCount;
+            }
         }
+        logSifModuleAction("load", moduleId, modulePath, refs);
 
-        const auto loaded = runtime->loadIopModule(modulePath, arguments.empty() ? nullptr : arguments.data(), static_cast<uint32_t>(arguments.size()));
-        if (!loaded.handled || loaded.moduleId <= 0)
-        {
-            setReturnS32(ctx, -1);
-            return;
-        }
-
-        trackSifModuleLoadExternal(modulePath, loaded.moduleId);
-        logSifModuleAction("load-emulated", loaded.moduleId, modulePath, 1u);
-        setReturnS32(ctx, loaded.moduleId);
+        setReturnS32(ctx, moduleId);
     }
 
     void SifInitRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         std::lock_guard<std::mutex> lock(g_rpc_mutex);
+        // Initializing the EE RPC client must not reboot the IOP services.
         if (!g_rpc_initialized)
         {
             g_rpc_servers.clear();
@@ -295,12 +302,9 @@ namespace ps2_syscalls
             g_rpc_clients[clientPtr].sid = rpcId;
         }
 
-        if (!serverPtr && PS2IopTransport::canBindRpc(runtime, rpcId))
+        if (!serverPtr)
         {
-            // EE-side servers and HLE routes need a descriptor in guest RAM.
-            // With an emulated IOP, only publish it after the IRX has actually
-            // registered the SID; cd->server == nullptr is the SDK's retry
-            // signal while the IOP server thread is still starting.
+            // Allocate a dummy server so bind loops can proceed.
             serverPtr = rpcAllocServerAddr(rdram);
             if (serverPtr)
             {
