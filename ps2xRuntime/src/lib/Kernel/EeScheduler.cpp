@@ -353,8 +353,16 @@ void EeScheduler::run()
         m_runtime.m_debugSp.store(getRegU32(&context, 29), std::memory_order_relaxed);
         m_runtime.m_debugGp.store(getRegU32(&context, 28), std::memory_order_relaxed);
 
+        // TOL_TRACE_PARK=1: a generated function returned into pc 0 (a jr ra with ra == 0). The dispatch that
+        // produced it is the last non-zero pc this loop saw; that names the function that bailed.
+        static uint32_t sPs2LastNonZeroPc = 0u;
         if (context.pc == 0u)
         {
+            if (std::getenv("TOL_TRACE_PARK") != nullptr)
+                std::cerr << "[ee-park] thread=" << running->id << " returned-to-pc0 from=0x" << std::hex
+                          << sPs2LastNonZeroPc << " ra=0x" << getRegU32(&context, 31) << " sp=0x"
+                          << getRegU32(&context, 29) << std::dec
+                          << " invocations=" << running->invocations.size() << std::endl;
             if (!running->invocations.empty())
             {
                 GuestInvocation completed = std::move(running->invocations.back());
@@ -375,6 +383,8 @@ void EeScheduler::run()
             m_currentThreadId = 0;
             continue;
         }
+
+        sPs2LastNonZeroPc = context.pc;
 
         // Invocations nest onto the running thread, so a callback storm stacks
         // them faster than they retire -- DQ8's movie streaming reached depth 13
