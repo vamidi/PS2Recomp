@@ -375,8 +375,19 @@ public:
     // Passing nullptr removes the resolver.
     static void setFunctionRegionResolver(FunctionRegionResolver resolver, void *userData);
 
-    bool replaceFunction(uint32_t address, RecompiledFunction func);
-    // TODO remove this later need to update all tests
+    // Compatibility with corpora generated before the runtime dropped VU0 access tracking. The older generator
+    // bracketed every VU0 register access with these two calls, passing the context and the instruction word
+    // (for example 0x4842E800 for `cfc2.ni`). Nothing observes them any more, so they do nothing; removing them
+    // would mean regenerating ~1,520 translation units.
+    void beforeVu0Access(R5900Context *, uint32_t) {}
+    void afterVu0Access(R5900Context *, uint32_t) {}
+
+    // The old runtime answered this from EeScheduler::transferPending(): generated code used it to bail out of a
+    // dispatch while a scheduler-owned transfer was outstanding. The synced scheduler has no such state (events are
+    // processed through checkpoints instead), so nothing is ever pending here.
+    [[nodiscard]] bool eeTransferPending() const noexcept { return false; }
+
+    bool replaceFunction(uint32_t address, RecompiledFunction func);    // TODO remove this later need to update all tests
     bool registerFunction(uint32_t address, RecompiledFunction func);
     RecompiledFunction lookupFunction(uint32_t address);
     bool hasFunction(uint32_t address) const;
