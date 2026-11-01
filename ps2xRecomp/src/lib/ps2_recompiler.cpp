@@ -1864,6 +1864,14 @@ namespace ps2recomp
             ownerTargets.insert(ownerTargets.end(),
                                 analysisResult.indirectFallbackEntryPoints.begin(),
                                 analysisResult.indirectFallbackEntryPoints.end());
+            // Option A: a computed jump (jalr through a function pointer or a jump table) can enter a function at
+            // ANY decoded instruction, and the guest has no notion of an "entry point". Register a resume slot for
+            // every instruction so such a jump resumes mid-function instead of failing to dispatch. The generated
+            // table is dense per 4 bytes, so this fills existing slots rather than growing the table.
+            for (const Instruction &everyInst : instructions)
+            {
+                ownerTargets.push_back(everyInst.address);
+            }
 
             for (uint32_t target : analysisResult.externalEntryPoints)
             {
