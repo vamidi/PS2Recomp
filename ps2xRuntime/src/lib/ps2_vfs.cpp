@@ -7,12 +7,22 @@
 #include <chrono>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <utility>
 
 namespace
 {
+    // TOL_TRACE_FILEIO=1: the syscall and stub layers only log failures, so a quiet run cannot distinguish
+    // "the guest never opened a file" from "it opened files successfully". Log every open attempt here, at the
+    // one choke point all guest file access funnels through.
+    bool traceFileIoEnabled()
+    {
+        static const bool enabled = std::getenv("TOL_TRACE_FILEIO") != nullptr;
+        return enabled;
+    }
+
     class HostOpenFile final : public IPS2OpenFile
     {
     public:
@@ -156,9 +166,15 @@ PS2Vfs::~PS2Vfs() = default;
 
 int32_t PS2Vfs::open(std::string_view path, uint32_t flags, const PS2VfsMounts &mounts, const PS2RomDevice &rom)
 {
+    const bool trace = traceFileIoEnabled();
+    const std::string guestPath(path);
     const ps2x::iop::ParsedPs2Path parsed = ps2x::iop::parsePs2Path(path);
     if (!parsed)
+    {
+        if (trace)
+            std::fprintf(stderr, "[fileio] open '%s' -> FAILED (guest path did not parse)\n", guestPath.c_str());
         return -1;
+    }
 
     std::unique_ptr<IPS2OpenFile> file;
     if (parsed.device == ps2x::iop::Ps2PathDevice::Rom0)
@@ -168,14 +184,26 @@ int32_t PS2Vfs::open(std::string_view path, uint32_t flags, const PS2VfsMounts &
             return -1;
         std::vector<uint8_t> bytes;
         if (!rom.readFile(parsed.path, bytes))
+        {
+            if (trace)
+                std::fprintf(stderr, "[fileio] open 'rom0:%s' -> FAILED (rom0 file not found)\n",
+                             parsed.path.c_str());
             return -1;
+        }
+        if (trace)
+            std::fprintf(stderr, "[fileio] open 'rom0:%s' -> ok, %zu bytes\n", parsed.path.c_str(), bytes.size());
         file = std::make_unique<MemoryOpenFile>(std::move(bytes));
     }
     else
     {
         std::filesystem::path hostPath;
         if (!resolveHostPath(path, mounts, hostPath))
+        {
+            if (trace)
+                std::fprintf(stderr, "[fileio] open '%s' -> FAILED (no mount resolves this path)\n",
+                             guestPath.c_str());
             return -1;
+        }
 
         std::error_code existsError;
         const bool exists = std::filesystem::exists(hostPath, existsError);
@@ -193,7 +221,15 @@ int32_t PS2Vfs::open(std::string_view path, uint32_t flags, const PS2VfsMounts &
             stream = std::fopen(hostPath.string().c_str(), "w+b");
         }
         if (!stream)
+        {
+            if (trace)
+                std::fprintf(stderr, "[fileio] open '%s' -> FAILED (host '%s')\n",
+                             guestPath.c_str(), hostPath.string().c_str());
             return -1;
+        }
+        if (trace)
+            std::fprintf(stderr, "[fileio] open '%s' -> ok (host '%s')\n",
+                         guestPath.c_str(), hostPath.string().c_str());
         file = std::make_unique<HostOpenFile>(stream);
     }
 

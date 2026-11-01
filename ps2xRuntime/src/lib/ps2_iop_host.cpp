@@ -8,6 +8,8 @@
 #include "Kernel/Syscalls/Common.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -293,6 +295,11 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
         return 0u;
     }
 
+    // TOL_TRACE_FILEIO=1: this is the IOP-side host opener (cdrom0:, host:, mc0:). Without it a quiet run
+    // cannot distinguish "no file I/O" from "file I/O that succeeded", because failures are the only thing
+    // the stub layers log.
+    const bool traceFileIo = std::getenv("TOL_TRACE_FILEIO") != nullptr;
+
     const std::filesystem::path hostPath{std::string(path)};
 #if defined(_WIN32)
     std::FILE *stream = ::_wfopen(hostPath.c_str(), L"rb");
@@ -301,6 +308,8 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
 #endif
     if (!stream)
     {
+        if (traceFileIo)
+            std::fprintf(stderr, "[fileio] iop open '%s' -> FAILED (missing)\n", hostPath.string().c_str());
         return 0u;
     }
 
@@ -319,6 +328,10 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
         handle = m_nextHostFileHandle++;
     }
     m_hostFiles.emplace(handle, HostFile{stream, size});
+    if (traceFileIo)
+        std::fprintf(stderr, "[fileio] iop open '%s' -> ok, %llu bytes (handle %llu)\n",
+                     hostPath.string().c_str(), static_cast<unsigned long long>(size),
+                     static_cast<unsigned long long>(handle));
     return handle;
 }
 
