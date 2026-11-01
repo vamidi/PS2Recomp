@@ -44,7 +44,7 @@ function(EnableFastReleaseMode TargetName)
                 /DNDEBUG
                 $<$<BOOL:${PS2X_ENABLE_AVX2}>:/arch:AVX2> # Advanced Vector Extensions 2
                 /GS- # Disable Buffer Security Check (faster)
-                /Qspectre- # Disable Spectre mitigations (faster)
+                # /Qspectre- dropped: clang-cl rejects it (it treats it as a file name). Only disables a mitigation.
             >
         )
 
