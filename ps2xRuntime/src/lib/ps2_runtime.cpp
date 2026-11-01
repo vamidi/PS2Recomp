@@ -1443,7 +1443,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // "jr with ra == 0" and the chain says which call introduced it.
     {
         static uint32_t sDispatchLogs = 0u;
-        if (sDispatchLogs < 45u && std::getenv("TOL_TRACE_DISPATCH") != nullptr)
+        if (sDispatchLogs < 4000u && std::getenv("TOL_TRACE_DISPATCH") != nullptr)
         {
             ++sDispatchLogs;
             std::cerr << "[dispatch] kind=" << static_cast<int>(kind) << " target=0x" << std::hex << targetPc
@@ -1584,6 +1584,8 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
     const uint32_t syscallA1 = traceSyscall ? getRegU32(ctx, 5) : 0u;
     const uint32_t syscallA2 = traceSyscall ? getRegU32(ctx, 6) : 0u;
     const uint32_t syscallA3 = traceSyscall ? getRegU32(ctx, 7) : 0u;
+    const uint32_t syscallSite = traceSyscall ? ctx->pc : 0u;
+    const uint32_t syscallRa = traceSyscall ? getRegU32(ctx, 31) : 0u;
 
     const bool syscallHandled = ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this);
 
@@ -1597,7 +1599,8 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
             std::cerr << "[syscall] 0x" << std::hex << syscallId << " a0=0x" << syscallA0 << " a1=0x" << syscallA1
                       << " a2=0x" << syscallA2 << " a3=0x" << syscallA3 << " -> v0=0x"
                       << static_cast<uint32_t>(returnValue) << std::dec
-                      << (returnValue < 0 ? " ERROR" : "") << " handled=" << (syscallHandled ? 1 : 0) << std::endl;
+                      << (returnValue < 0 ? " ERROR" : "") << " handled=" << (syscallHandled ? 1 : 0)
+                      << " at=0x" << std::hex << syscallSite << " ra=0x" << syscallRa << std::dec << std::endl;
         }
     }
 

@@ -8,11 +8,27 @@
 #include <limits>
 #include <stdexcept>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
 namespace
 {
+    // TOL_TRACE_SIF=1: the SIF block (0x10001000..0x10001800) is a plain register file here, so the IOP can never
+    // answer a command and the guest's RPC client polls forever. Log every write: the command word identifies the
+    // RPC the guest is waiting on.
+    bool traceSifEnabled()
+    {
+        static const bool enabled = std::getenv("TOL_TRACE_SIF") != nullptr;
+        return enabled;
+    }
+
+    inline bool isSifRegister(uint32_t address)
+    {
+        return address >= 0x10001000u && address < 0x10001800u;
+    }
+
     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
     {
         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) > static_cast<uint64_t>(regionSize))
@@ -1154,6 +1170,15 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    if (isSifRegister(address) && traceSifEnabled())
+    {
+        static uint32_t sSifWrites = 0u;
+        if (sSifWrites < 200u)
+        {
+            ++sSifWrites;
+            std::fprintf(stderr, "[sif] write 0x%08x = 0x%08x\n", address, value);
+        }
+    }
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
