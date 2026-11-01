@@ -300,8 +300,23 @@ namespace ps2_syscalls
             Deci2Call(rdram, ctx, runtime);
             return true;
         case 0x83:
-            FindAddress(rdram, ctx, runtime);
-            return true;
+    {
+        // TOL_TRACE_FINDADDR=1: FindAddress(a0=start, a1=end, a2=target) -> v0 = matching word address or 0.
+        const bool traceFindAddr = std::getenv("TOL_TRACE_FINDADDR") != nullptr;
+        const uint32_t faStart = getRegU32(ctx, 4), faEnd = getRegU32(ctx, 5), faTarget = getRegU32(ctx, 6);
+        FindAddress(rdram, ctx, runtime);
+        if (traceFindAddr)
+        {
+            static uint32_t sFindAddrLogs = 0u;
+            if (sFindAddrLogs < 8u)
+            {
+                ++sFindAddrLogs;
+                std::cerr << "[findaddr] start=0x" << std::hex << faStart << " end=0x" << faEnd << " target=0x"
+                          << faTarget << " -> v0=0x" << getRegU32(ctx, 2) << std::dec << std::endl;
+            }
+        }
+        return true;
+    }
         case 0x85:
             SetMemoryMode(rdram, ctx, runtime);
             return true;

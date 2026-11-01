@@ -1444,6 +1444,16 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // this charge bounds straight-line call chains that have no local loop.
     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
     {
+        // TOL_TRACE_CKPT=1: a preemption here is reported to the generated caller as a failed dispatch, and the
+        // caller treats that as a bail-out (if (!dispatchGuestBranch(...)) return;). Count it and sample the pc so a
+        // boot that is merely preempted is not mistaken for a broken call chain.
+        static uint64_t sCkptDeclines = 0u;
+        ++sCkptDeclines;
+        if ((sCkptDeclines & 0x3FFu) == 0u && std::getenv("TOL_TRACE_CKPT") != nullptr)
+        {
+            std::cerr << "[ee-ckpt] dispatch declined by checkpoint total=" << sCkptDeclines << " target=0x" << std::hex
+                      << targetPc << " kind=" << static_cast<int>(kind) << std::dec << std::endl;
+        }
         return false;
     }
 
