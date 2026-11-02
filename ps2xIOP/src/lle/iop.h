@@ -174,6 +174,10 @@ namespace ps2x::iop::lle
         void call(uint32_t function, std::initializer_list<uint32_t> arguments, uint32_t *result, uint32_t gp);
         bool runThreads(uint64_t budget, bool advanceClock = true);
         Thread *current() { return m_current ? &m_threads.at(m_current) : nullptr; }
+        // TOL_TRACE_IOP_SEMA=1: names the threads around a semaphore so a wait with no signaler is visible.
+        void traceSema(const char *op, int32_t id, uint32_t pc);
+        // Same for event flags (the IOP's other common "waiting for work" primitive).
+        void traceEventFlag(const char *op, int32_t id, uint32_t pc);
         void makeReady(Thread &thread, uint32_t result);
         void block(Wait wait, int32_t id);
         void reschedule() { m_reschedule = true; }

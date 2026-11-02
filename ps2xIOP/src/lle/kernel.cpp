@@ -716,7 +716,30 @@ namespace ps2x::iop::lle
         semaphore.maximum = static_cast<int32_t>(m_bus.read32(param + 12u));
         const int32_t id = m_nextId++;
         m_semaphores[id] = semaphore;
+        traceSema("create", id, c.pc);
         ret(c, static_cast<uint32_t>(id));
+    }
+
+    void Iop::traceSema(const char *op, int32_t id, uint32_t pc)
+    {
+        if (std::getenv("TOL_TRACE_IOP_SEMA") == nullptr)
+            return;
+        static uint32_t sLines = 0u;
+        if (sLines++ > 4000u)
+            return;
+        const auto found = m_semaphores.find(id);
+        const int32_t count = found == m_semaphores.end() ? -999 : found->second.count;
+        const int32_t maximum = found == m_semaphores.end() ? -999 : found->second.maximum;
+        int32_t waiters = 0;
+        for (const auto &[threadId, thread] : m_threads)
+            waiters += thread.wait == Wait::Semaphore && thread.waitId == id ? 1 : 0;
+        Thread *thread = current();
+        char text[16];
+        std::snprintf(text, sizeof(text), "%08X", pc);
+        m_ee.log("[iop] sema " + std::to_string(id) + " " + op + " by thread " +
+                 std::to_string(thread ? thread->id : 0) + " at 0x" + text + " count=" +
+                 std::to_string(count) + "/" + std::to_string(maximum) + " waiters=" +
+                 std::to_string(waiters));
     }
 
     void Iop::deleteSema(CpuContext &c)
@@ -726,6 +749,7 @@ namespace ps2x::iop::lle
             if (thread.wait == Wait::Semaphore && thread.waitId == id)
                 makeReady(thread, static_cast<uint32_t>(-425)); // KE_WAIT_DELETE
         m_semaphores.erase(id);
+        traceSema("delete", id, c.pc);
         ret(c, 0);
     }
 
@@ -748,6 +772,7 @@ namespace ps2x::iop::lle
             makeReady(*waiter, 0u);
         else if (found->second.count < found->second.maximum || found->second.maximum == 0)
             ++found->second.count;
+        traceSema("signal", id, c.pc);
         ret(c, 0);
     }
 
@@ -768,6 +793,7 @@ namespace ps2x::iop::lle
         }
         if (Thread *thread = current())
             thread->readySequence = ++m_readySequence;
+        traceSema("wait", id, c.pc);
         ret(c, 0);
         block(Wait::Semaphore, id);
     }
@@ -781,6 +807,7 @@ namespace ps2x::iop::lle
             return;
         }
         --found->second.count;
+        traceSema("poll", static_cast<int32_t>(arg(c, 0)), c.pc);
         ret(c, 0);
     }
 
@@ -815,7 +842,30 @@ namespace ps2x::iop::lle
         flag.bits = m_bus.read32(param + 8u);
         const int32_t id = m_nextId++;
         m_eventFlags[id] = flag;
+        traceEventFlag("create", id, c.pc);
         ret(c, static_cast<uint32_t>(id));
+    }
+
+    void Iop::traceEventFlag(const char *op, int32_t id, uint32_t pc)
+    {
+        if (std::getenv("TOL_TRACE_IOP_SEMA") == nullptr)
+            return;
+        static uint32_t sLines = 0u;
+        if (sLines++ > 4000u)
+            return;
+        const auto found = m_eventFlags.find(id);
+        const uint32_t bits = found == m_eventFlags.end() ? 0xDEADBEEFu : found->second.bits;
+        int32_t waiters = 0;
+        for (const auto &[threadId, thread] : m_threads)
+            waiters += thread.wait == Wait::EventFlag && thread.waitId == id ? 1 : 0;
+        Thread *thread = current();
+        char text[16];
+        char mask[16];
+        std::snprintf(text, sizeof(text), "%08X", pc);
+        std::snprintf(mask, sizeof(mask), "%08X", bits);
+        m_ee.log("[iop] evflag " + std::to_string(id) + " " + op + " by thread " +
+                 std::to_string(thread ? thread->id : 0) + " at 0x" + text + " bits=0x" + mask +
+                 " waiters=" + std::to_string(waiters));
     }
 
     void Iop::deleteEventFlag(CpuContext &c)
@@ -839,6 +889,7 @@ namespace ps2x::iop::lle
         }
         EventFlag &flag = found->second;
         flag.bits |= arg(c, 1);
+        traceEventFlag("set", id, c.pc);
         for (auto &[threadId, thread] : m_threads)
         {
             if (thread.wait != Wait::EventFlag || thread.waitId != id)
@@ -864,6 +915,7 @@ namespace ps2x::iop::lle
         const auto found = m_eventFlags.find(static_cast<int32_t>(arg(c, 0)));
         if (found != m_eventFlags.end())
             found->second.bits &= arg(c, 1);
+        traceEventFlag("clear", static_cast<int32_t>(arg(c, 0)), c.pc);
         ret(c, 0);
     }
 
@@ -887,6 +939,7 @@ namespace ps2x::iop::lle
                 flag.bits = 0;
             else if (mode & 0x20u)
                 flag.bits &= ~bits;
+            traceEventFlag("wait-ok", id, c.pc);
             ret(c, 0);
             return;
         }
@@ -896,6 +949,7 @@ namespace ps2x::iop::lle
             thread->waitMode = mode;
             thread->waitResult = result;
         }
+        traceEventFlag("wait-block", id, c.pc);
         ret(c, 0);
         block(Wait::EventFlag, id);
     }
