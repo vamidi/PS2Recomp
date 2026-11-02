@@ -620,13 +620,13 @@ static void maybeWriteScreenshot(GS &gs)
     };
     static const Config config = [] {
         Config parsed{};
-        const char *dir = std::getenv("DQ8_GFX_SCREENSHOT_DIR");
+        const char *dir = std::getenv("TOL_GFX_SCREENSHOT_DIR");
         if (dir == nullptr || *dir == '\0')
         {
             return parsed;
         }
         parsed.directory = dir;
-        const char *every = std::getenv("DQ8_GFX_SCREENSHOT_EVERY");
+        const char *every = std::getenv("TOL_GFX_SCREENSHOT_EVERY");
         const long long value = every ? std::atoll(every) : 0;
         parsed.every = value > 0 ? static_cast<uint64_t>(value) : 60ull;
         return parsed;

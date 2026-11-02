@@ -539,7 +539,7 @@ namespace ps2_stubs
         size_t mpegMaxPendingEsBytes()
         {
             static const size_t bytes = [] {
-                const char *value = std::getenv("DQ8_MPEG_ES_BUFFER_MB");
+                const char *value = std::getenv("TOL_MPEG_ES_BUFFER_MB");
                 const long parsed = value ? std::atol(value) : 0;
                 return (parsed > 0 ? static_cast<size_t>(parsed) : 32u) * 1024u * 1024u;
             }();
@@ -644,7 +644,7 @@ namespace ps2_stubs
         bool mpegSkipMovies()
         {
             static const bool skip = [] {
-                const char *value = std::getenv("DQ8_SKIP_MOVIES");
+                const char *value = std::getenv("TOL_SKIP_MOVIES");
                 return value != nullptr && *value != '\0' && *value != '0';
             }();
             return skip;
@@ -658,7 +658,7 @@ namespace ps2_stubs
         size_t mpegDemuxYieldInterval()
         {
             static const size_t interval = [] {
-                const char *value = std::getenv("DQ8_MPEG_YIELD_EVERY");
+                const char *value = std::getenv("TOL_MPEG_YIELD_EVERY");
                 const long parsed = value ? std::atol(value) : 0;
                 return parsed > 0 ? static_cast<size_t>(parsed) : 64u;
             }();

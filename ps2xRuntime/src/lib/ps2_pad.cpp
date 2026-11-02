@@ -291,8 +291,8 @@ namespace
     void ensurePadScriptLoaded()
     {
         static const bool loaded = [] {
-            const char *value = std::getenv("DQ8_PAD_SCRIPT");
-            g_padScriptVerbose = std::getenv("DQ8_PAD_SCRIPT_VERBOSE") != nullptr;
+            const char *value = std::getenv("TOL_PAD_SCRIPT");
+            g_padScriptVerbose = std::getenv("TOL_PAD_SCRIPT_VERBOSE") != nullptr;
             if (value == nullptr || *value == '\0')
             {
                 return true;

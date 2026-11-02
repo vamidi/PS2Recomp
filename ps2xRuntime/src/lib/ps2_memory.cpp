@@ -1179,6 +1179,19 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             std::fprintf(stderr, "[sif] write 0x%08x = 0x%08x\n", address, value);
         }
     }
+
+    // TOL_TRACE_SIF also covers the SIF DMA channels (0x1000C000..SIF0, +0x400 SIF1, +0x800 SIF2, +0xC00 SPR0),
+    // which this memory model does not emulate: only VIF0/VIF1/GIF have channel handling. Whether the guest drives
+    // SIF by DMA or by register pokes decides where the IOP routing hook has to live.
+    if (traceSifEnabled() && address >= 0x1000C000u && address < 0x1000D000u)
+    {
+        static uint32_t sSifDmaWrites = 0u;
+        if (sSifDmaWrites < 160u)
+        {
+            ++sSifDmaWrites;
+            std::fprintf(stderr, "[sifdma] write 0x%08x = 0x%08x\n", address, value);
+        }
+    }
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))

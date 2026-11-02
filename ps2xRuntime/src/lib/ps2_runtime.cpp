@@ -2651,7 +2651,7 @@ void PS2Runtime::run()
                 // race is sensitive to exactly that
                 // (docs/notes/memory-card-boot-race.md).
                 static const int idleMicros = [] {
-                    const char *value = std::getenv("DQ8_PRESENT_IDLE_US");
+                    const char *value = std::getenv("TOL_PRESENT_IDLE_US");
                     const int parsed = value ? std::atoi(value) : 0;
                     return parsed > 0 ? parsed : 1000;
                 }();

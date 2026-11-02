@@ -39,13 +39,13 @@ std::atomic<uint64_t> g_eeEnterGuestCount{0};
 namespace
 {
     const uint64_t g_eeCycleScale = [] {
-        const char *value = std::getenv("DQ8_EE_CYCLE_SCALE");
+        const char *value = std::getenv("TOL_EE_CYCLE_SCALE");
         const long long parsed = value ? std::atoll(value) : 0;
         return parsed > 0 ? static_cast<uint64_t>(parsed) : 1ull;
     }();
 
     const uint64_t g_eeDispatchHistogramInterval = [] {
-        const char *value = std::getenv("DQ8_EE_DISPATCH_HISTOGRAM");
+        const char *value = std::getenv("TOL_EE_DISPATCH_HISTOGRAM");
         const long long parsed = value ? std::atoll(value) : 0;
         return parsed > 0 ? static_cast<uint64_t>(parsed) : 0ull;
     }();
@@ -102,7 +102,7 @@ namespace
         uint64_t starts = 0, rebases = 0, maxLatenessUs = 0, lines = 0;
     };
     thread_local VBlankPacingTrace g_vblankPacingTrace;
-    const bool g_traceVBlankPacing = std::getenv("DQ8_VBLANK_PACING_TRACE") != nullptr;
+    const bool g_traceVBlankPacing = std::getenv("TOL_VBLANK_PACING_TRACE") != nullptr;
 
     void traceVBlankPacing(uint64_t tick, uint64_t cycle,
                           std::chrono::steady_clock::time_point now,
@@ -2140,7 +2140,7 @@ void EeScheduler::enterGuest(GuestThread &thread)
         // Sized for deeply nested guest call chains; mapped lazily, so the
         // resident cost is only the pages a thread actually touches.
         static const size_t stackBytes = [] {
-            const char *value = std::getenv("DQ8_EE_FIBER_STACK_KB");
+            const char *value = std::getenv("TOL_EE_FIBER_STACK_KB");
             const long long parsed = value ? std::atoll(value) : 0;
             const size_t kb = parsed > 0 ? static_cast<size_t>(parsed) : 8192u;
             return kb * 1024u;

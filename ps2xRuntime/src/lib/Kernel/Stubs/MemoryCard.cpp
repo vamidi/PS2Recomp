@@ -113,7 +113,7 @@ namespace ps2_stubs
         bool mcTraceEnabled()
         {
             static const bool on = [] {
-                const char *value = std::getenv("DQ8_MC_TRACE");
+                const char *value = std::getenv("TOL_MC_TRACE");
                 return value != nullptr && *value != '\0' && *value != '0';
             }();
             return on;
