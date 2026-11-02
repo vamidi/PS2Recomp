@@ -1,7 +1,10 @@
 #include "iop.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <set>
+#include <tuple>
 
 namespace ps2x::iop::lle
 {
@@ -371,13 +374,42 @@ namespace ps2x::iop::lle
                 }
                 const uint32_t code = m_cpu.syscallCode();
                 thread->context.pc = thread->context.gpr[31];
+                if (std::getenv("TOL_TRACE_IOP_PC") != nullptr)
+                {
+                    static uint32_t sTraced = 0u;
+                    if (sTraced < 4000u)
+                    {
+                        ++sTraced;
+                        char pc[16];
+                        std::snprintf(pc, sizeof(pc), "%08X", thread->context.pc);
+                        m_ee.log("[iop] thread " + std::to_string(thread->id) + " syscall #" +
+                                 std::to_string(code) + " at 0x" + pc);
+                    }
+                }
                 if (code < m_handlers.size())
                 {
                     m_lastHandler = code;
                     (this->*m_handlers[code])(thread->context);
                 }
                 if (thread->dormant || thread->wait != Wait::None)
+                {
+                    if (std::getenv("TOL_TRACE_IOP_PC") != nullptr)
+                    {
+                        static std::set<std::tuple<int32_t, int, int32_t>> sSeenWaits;
+                        const auto key = std::make_tuple(thread->id, static_cast<int>(thread->wait),
+                                                         thread->waitId);
+                        if (sSeenWaits.insert(key).second)
+                        {
+                            char pc[16];
+                            std::snprintf(pc, sizeof(pc), "%08X", thread->context.pc);
+                            m_ee.log("[iop] thread " + std::to_string(thread->id) + " waits kind=" +
+                                     std::to_string(static_cast<int>(thread->wait)) + " id=" +
+                                     std::to_string(thread->waitId) + " pc=0x" + pc +
+                                     (thread->dormant ? " (dormant)" : ""));
+                        }
+                    }
                     break;
+                }
             }
             deliverRequests();
         }
