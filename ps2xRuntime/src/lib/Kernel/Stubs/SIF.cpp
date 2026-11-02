@@ -887,6 +887,29 @@ namespace ps2_stubs
             {
                 (void)native->load(imagePath, std::string());
             }
+            // An IOP boot image is not a module: it is the romdir container the game reboots the IOP with,
+            // so its modules have to be started rather than tracked as one loaded module. The guest path
+            // carries the ISO version suffix ("...IMG;1"), which has to come off before the extension test.
+            if (read)
+            {
+                std::string stem = imagePath;
+                if (const size_t version = stem.rfind(';'); version != std::string::npos)
+                {
+                    stem.erase(version);
+                }
+                const bool isImage =
+                    stem.size() > 4u && (stem.compare(stem.size() - 4u, 4u, ".IMG") == 0 ||
+                                         stem.compare(stem.size() - 4u, 4u, ".img") == 0);
+                if (isImage)
+                {
+                    const int started = PS2IopTransport::bootIopImage(runtime, image);
+                    if (std::getenv("TOL_TRACE_FILEIO") != nullptr)
+                    {
+                        std::fprintf(stderr, "[sif] boot image '%s' -> %d module(s) started\n", imagePath.c_str(),
+                                     started);
+                    }
+                }
+            }
             if (std::getenv("TOL_TRACE_FILEIO") != nullptr)
             {
                 std::fprintf(stderr, "[sif] load-module '%s' -> '%s' %s (%zu bytes)\n", path.c_str(),

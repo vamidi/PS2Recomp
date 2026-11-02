@@ -292,8 +292,7 @@ std::string PS2IopHostAdapter::translateGuestPath(std::string_view path) const
 // SIF load-module commands carry a guest path ("cdrom0:\IRX\IOPRP300.IMG;1") instead of an RPC, so the
 // runtime has to reach the same file layer the IOP would. Translating and opening here keeps one choke
 // point for every IOP-side read, which is what TOL_TRACE_FILEIO reports on.
-bool PS2IopTransport::readHostFile(PS2Runtime *runtime, std::string_view guestPath, std::vector<uint8_t> &out)
-{
+bool PS2IopTransport::readHostFile(PS2Runtime *runtime, std::string_view guestPath, std::vector<uint8_t> &out){
     out.clear();
     if (!runtime || !runtime->m_iopHost || guestPath.empty())
     {
@@ -322,6 +321,107 @@ bool PS2IopTransport::readHostFile(PS2Runtime *runtime, std::string_view guestPa
     }
     runtime->m_iopHost->closeHostFile(handle);
     return ok;
+}
+
+// Boots an IOP boot image (IOPRP*.IMG). The container is a romdir table followed by the module ELFs; the
+// table's first three entries (RESET, ROMDIR, EXTINFO) are the image's own tables, and the remaining names
+// line up with the ELFs in file order. Modules this runtime already provides as high-level LLE kernel
+// services are skipped - loading them would register the same libraries twice.
+int PS2IopTransport::bootIopImage(PS2Runtime *runtime, const std::vector<uint8_t> &image)
+{
+    if (!runtime || !runtime->m_iopSubsystem || image.size() < 0x200u)
+    {
+        return -1;
+    }
+    ps2x::iop::NativeIop &iop = runtime->m_iopSubsystem->native();
+
+    // romdir: {char name[10]; uint16 extinfo; uint32 size} from 0, terminated by an empty name.
+    std::vector<std::string> names;
+    for (size_t offset = 0; offset + 16u <= image.size(); offset += 16u)
+    {
+        const char *raw = reinterpret_cast<const char *>(image.data() + offset);
+        const std::string name(raw, strnlen(raw, 10u));
+        if (name.empty())
+        {
+            break;
+        }
+        names.push_back(name);
+    }
+    if (names.size() < 4u)
+    {
+        return -1; // not a romdir container
+    }
+
+    // Modules the LLE kernel emulates itself (sysmem, loadcore, sifman/sifcmd, threadman, ioman, fileio,
+    // timrman, sysclib, stdio). Their kernel-side counterparts must not be loaded on top.
+    static const char *kEmulated[] = {"RESET", "ROMDIR", "EXTINFO", "SYSMEM", "LOADCORE", "SIFCMD", "SIFMAN",
+                                      "THREADMAN", "IOMAN", "FILEIO", "TIMEMANI", "SYSCLIB", "STDIO"};
+    const auto emulated = [](const std::string &name)
+    {
+        for (const char *candidate : kEmulated)
+            if (name == candidate)
+                return true;
+        return false;
+    };
+
+    // The module images are ELF files; their offsets are found by magic because the romdir sizes are not the
+    // layout. Size comes from the program headers.
+    std::vector<std::pair<size_t, size_t>> modules; // offset, size
+    for (size_t offset = 0; offset + 52u <= image.size(); ++offset)
+    {
+        if (image[offset] != 0x7Fu || image[offset + 1] != 'E' || image[offset + 2] != 'L' ||
+            image[offset + 3] != 'F')
+        {
+            continue;
+        }
+        const uint32_t phoff = *reinterpret_cast<const uint32_t *>(image.data() + offset + 0x1C);
+        const uint16_t phnum = *reinterpret_cast<const uint16_t *>(image.data() + offset + 0x2C);
+        size_t end = 0x34u;
+        for (uint16_t index = 0; index < phnum; ++index)
+        {
+            const size_t entry = phoff + static_cast<size_t>(index) * 32u;
+            if (offset + entry + 32u > image.size())
+                break;
+            const uint32_t type = *reinterpret_cast<const uint32_t *>(image.data() + offset + entry);
+            const uint32_t fileOffset = *reinterpret_cast<const uint32_t *>(image.data() + offset + entry + 4u);
+            const uint32_t fileSize = *reinterpret_cast<const uint32_t *>(image.data() + offset + entry + 16u);
+            if (type == 1u)
+                end = std::max(end, static_cast<size_t>(fileOffset) + fileSize);
+        }
+        if (end != 0u && offset + end <= image.size())
+        {
+            modules.emplace_back(offset, end);
+        }
+        offset += 3u;
+    }
+    if (modules.empty())
+    {
+        return -1;
+    }
+
+    const bool trace = std::getenv("TOL_TRACE_FILEIO") != nullptr;
+    int started = 0;
+    // names[0..2] are RESET/ROMDIR/EXTINFO; the rest line up with the ELFs in order.
+    for (size_t index = 0; index < modules.size(); ++index)
+    {
+        const std::string name = (index + 3u < names.size()) ? names[index + 3u] : std::string("module");
+        if (emulated(name))
+        {
+            if (trace)
+                std::fprintf(stderr, "[ioprp] skip %s (emulated by the LLE kernel)\n", name.c_str());
+            continue;
+        }
+        const std::pair<size_t, size_t> module = modules[index];
+        std::vector<uint8_t> file(image.begin() + static_cast<long>(module.first),
+                                 image.begin() + static_cast<long>(module.first + module.second));
+        const int32_t id = iop.loadModuleFromMemory(std::move(file), name);
+        if (trace)
+            std::fprintf(stderr, "[ioprp] %s -> %s (%zu bytes)\n", name.c_str(), id > 0 ? "loaded" : "FAILED",
+                         module.second);
+        if (id > 0)
+            ++started;
+    }
+    return started;
 }
 
 uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)

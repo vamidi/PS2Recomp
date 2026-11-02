@@ -124,6 +124,17 @@ namespace ps2x::iop
         return id;
     }
 
+    // Starts a module whose bytes are already in memory, which is how an IOP boot image carries them.
+    int32_t NativeIop::loadModuleFromMemory(std::vector<uint8_t> file, std::string_view name)
+    {
+        std::lock_guard lock(m_impl->mutex);
+        const int32_t id = m_impl->iop.loadModule(file, std::string(name), {});
+        if (id > 0)
+            m_impl->loaded = true;
+        m_impl->iop.settle();
+        return id;
+    }
+
     bool NativeIop::server(uint32_t sid, uint32_t &record, uint32_t &buffer) const
     {
         std::lock_guard lock(m_impl->mutex);

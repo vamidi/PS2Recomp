@@ -29,6 +29,8 @@ namespace ps2x::iop
         bool claims(std::string_view guestPath) const;
         // Load a claimed module; arguments are NUL-separated as sceSifLoadModule passes them.
         int32_t load(std::string_view guestPath, std::string_view arguments);
+        // Start a module whose bytes are already in memory (an IOP boot image carries them inline).
+        int32_t loadModuleFromMemory(std::vector<uint8_t> file, std::string_view name);
 
         // A server a native module registered, with its record and receive buffer.
         bool server(uint32_t sid, uint32_t &record, uint32_t &buffer) const;

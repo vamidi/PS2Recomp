@@ -65,4 +65,9 @@ public:
     // emulated IOP would see it. SIF load-module commands carry a path rather than an RPC, so they have
     // no other way to reach the file layer. Defined in ps2_iop_host.cpp, where the adapter is complete.
     static bool readHostFile(PS2Runtime *runtime, std::string_view guestPath, std::vector<uint8_t> &out);
+
+    // Loads an IOP boot image (IOPRP*.IMG): a romdir container whose 16 real modules are ELF files. The
+    // modules the LLE kernel already provides as high-level services are skipped, because loading them would
+    // register the same libraries twice. Returns the number of modules started, or -1 if it is not an image.
+    static int bootIopImage(PS2Runtime *runtime, const std::vector<uint8_t> &image);
 };
