@@ -1,5 +1,6 @@
 #include "ps2_iop_host.h"
 
+#include "ps2_iop_transport.h"
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
 #include "Kernel/Stubs/SIF.h"
@@ -286,6 +287,41 @@ std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
 std::string PS2IopHostAdapter::translateGuestPath(std::string_view path) const
 {
     return translatePs2Path(std::string(path).c_str());
+}
+
+// SIF load-module commands carry a guest path ("cdrom0:\IRX\IOPRP300.IMG;1") instead of an RPC, so the
+// runtime has to reach the same file layer the IOP would. Translating and opening here keeps one choke
+// point for every IOP-side read, which is what TOL_TRACE_FILEIO reports on.
+bool PS2IopTransport::readHostFile(PS2Runtime *runtime, std::string_view guestPath, std::vector<uint8_t> &out)
+{
+    out.clear();
+    if (!runtime || !runtime->m_iopHost || guestPath.empty())
+    {
+        return false;
+    }
+
+    const std::string hostPath = runtime->m_iopHost->translateGuestPath(guestPath);
+    const uint64_t handle = runtime->m_iopHost->openHostFile(hostPath);
+    if (handle == 0u)
+    {
+        return false;
+    }
+
+    bool ok = false;
+    uint64_t size = 0u;
+    // An IOP image is a few hundred KiB; refuse anything absurd rather than allocating it.
+    if (runtime->m_iopHost->hostFileSize(handle, size) && size > 0u && size <= (16u << 20))
+    {
+        out.resize(static_cast<size_t>(size));
+        size_t read = 0u;
+        ok = runtime->m_iopHost->readHostFile(handle, 0u, out.data(), out.size(), read) && read == out.size();
+        if (!ok)
+        {
+            out.clear();
+        }
+    }
+    runtime->m_iopHost->closeHostFile(handle);
+    return ok;
 }
 
 uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)

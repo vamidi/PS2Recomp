@@ -77,6 +77,16 @@ namespace ps2_stubs
         uint32_t g_sifSetRegLogCount = 0u;
 
         constexpr uint32_t kSifRegBootStatus = 0x4u;
+        // The IOP's boot-status register also reports "the load I was asked to start has finished".
+        constexpr uint32_t kSifLoadDoneMask = 0x00040000u;
+        // SIF command id libsif's sceSifLoadModule sends to hand the IOP a module image to reboot with.
+        constexpr uint32_t kSifCmdLoadModule = 0x80000003u;
+        // Command packet: { size, dest, cid, ... } and the payload follows; the module path sits at 0x18.
+        constexpr uint32_t kSifCmdPathOffset = 0x18u;
+        constexpr uint32_t kSifCmdMinSize = 0x20u;
+        // Set by the command, reported on the next read of the boot-status register: the IOP finishes the
+        // load asynchronously, after the EE has already rewritten that register.
+        bool g_sifLoadPending = false;
         constexpr uint32_t kSifRegMainAddr = 0x80000000u;
         constexpr uint32_t kSifRegSubAddr = 0x80000001u;
         constexpr uint32_t kSifRegMsCom = 0x80000002u;
@@ -90,6 +100,7 @@ namespace ps2_stubs
             g_sifCmdBuffer = 0u;
             g_sifSysCmdBuffer = 0u;
             g_sifCmdInitialized = false;
+            g_sifLoadPending = false;
             g_sifGetRegLogCount = 0u;
             g_sifSetRegLogCount = 0u;
 
@@ -637,6 +648,19 @@ namespace ps2_stubs
             {
                 value = it->second;
             }
+            // The IOP reports a finished load here, after the EE has already rewritten the register, so
+            // the bit is applied on read rather than stored.
+            if (reg == kSifRegBootStatus && g_sifLoadPending)
+            {
+                value |= kSifLoadDoneMask;
+                // The IOP leaves the bit set until the EE clears it, so store it rather than reporting it
+                // once: the guest polls this register again later, outside the load path.
+                g_sifRegs[kSifRegBootStatus] = value;
+                g_sifLoadPending = false;
+                // The rebooted IOP's command channel is up again. The load path cleared it before the DMA
+                // (sceSifSetReg(0x80000002, 0)), and the guest re-initialises the channel right after.
+                g_sifRegs[kSifRegMsCom] = 1u;
+            }
             shouldLog = shouldTraceSifReg(reg) && g_sifGetRegLogCount < 128u;
             if (shouldLog)
             {
@@ -788,6 +812,94 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    namespace
+    {
+        std::string readGuestPathBounded(uint8_t *rdram, uint32_t address, uint32_t maxLength)
+        {
+            std::string path;
+            path.reserve(64u);
+            for (uint32_t i = 0; i < maxLength; ++i)
+            {
+                const uint8_t *byte = getConstMemPtr(rdram, address + i);
+                if (!byte)
+                {
+                    break;
+                }
+                const char c = static_cast<char>(*byte);
+                if (c == '\0')
+                {
+                    return path;
+                }
+                path.push_back(c);
+            }
+            return path;
+        }
+
+        uint32_t readGuestU32(uint8_t *rdram, uint32_t address)
+        {
+            const uint8_t *bytes = getConstMemPtr(rdram, address);
+            if (!bytes)
+            {
+                return 0u;
+            }
+            uint32_t value = 0u;
+            std::memcpy(&value, bytes, sizeof(value));
+            return value;
+        }
+
+        // SIF load-module command: the path libsif's sceSifLoadModule hands the IOP to reboot with.
+        //
+        // The EE sends a packet {size, dest, cid = 0x80000003, ...} whose payload carries the module path
+        // (at 0x18) and then polls the boot-status register for bit 0x40000 until the IOP reports the load
+        // finished. There is no IOP kernel here to reboot, so the runtime opens the image through the
+        // IOP-side file layer - the same opener cdrom0:/host: go through, so the guest path resolves
+        // exactly as the IOP would resolve it - loads it onto the native IOP when that IOP claims the
+        // module, and reports the load as finished on the next boot-status read.
+        void handleSifLoadModuleCommand(uint8_t *rdram, PS2Runtime *runtime, uint32_t src, uint32_t size)
+        {
+            if (size < kSifCmdMinSize || readGuestU32(rdram, src + 0x08u) != kSifCmdLoadModule)
+            {
+                return;
+            }
+            const std::string path = readGuestPathBounded(rdram, src + kSifCmdPathOffset, 256u);
+            if (path.empty())
+            {
+                return;
+            }
+
+            // The game's own sceSifLoadModule wrapper prefixes the image with the ROM loader that consumes
+            // it: "rom0:UDNL cdrom0:\IRX\IOPRP300.IMG;1" (the prefix is a constant in its .data, never
+            // rewritten). The loader is a BIOS module this runtime has no image of; the file the IOP would
+            // read is the part after the first space.
+            std::string imagePath = path;
+            if (path.rfind("rom0:", 0) == 0)
+            {
+                const size_t space = path.find(' ');
+                if (space != std::string::npos && space + 1u < path.size())
+                {
+                    imagePath = path.substr(space + 1u);
+                }
+            }
+
+            std::vector<uint8_t> image;
+            const bool read = PS2IopTransport::readHostFile(runtime, imagePath, image);
+            if (ps2x::iop::NativeIop *native = nativeIop(runtime); native && native->claims(imagePath))
+            {
+                (void)native->load(imagePath, std::string());
+            }
+            if (std::getenv("TOL_TRACE_FILEIO") != nullptr)
+            {
+                std::fprintf(stderr, "[sif] load-module '%s' -> '%s' %s (%zu bytes)\n", path.c_str(),
+                             imagePath.c_str(), read ? "read" : "NOT READ", image.size());
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+                g_sifLoadPending = true;
+            }
+        }
+    }
+
     void sceSifSetDma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t dmatAddr = getRegU32(ctx, 4);
@@ -818,6 +930,7 @@ namespace ps2_stubs
                     continue;
                 }
                 native->write(xfer.dest, first, size);
+                handleSifLoadModuleCommand(rdram, runtime, xfer.src, size);
             }
             ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u);
             setReturnS32(ctx, static_cast<int32_t>(allocateSifDmaTransferId()));

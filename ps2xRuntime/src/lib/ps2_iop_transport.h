@@ -60,4 +60,9 @@ public:
             runtime->resetIop();
         }
     }
+
+    // Reads a whole guest file through the IOP-side opener (cdrom0:/host:/mc0:), i.e. the way the
+    // emulated IOP would see it. SIF load-module commands carry a path rather than an RPC, so they have
+    // no other way to reach the file layer. Defined in ps2_iop_host.cpp, where the adapter is complete.
+    static bool readHostFile(PS2Runtime *runtime, std::string_view guestPath, std::vector<uint8_t> &out);
 };
