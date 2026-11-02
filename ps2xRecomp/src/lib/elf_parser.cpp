@@ -987,6 +987,13 @@ namespace ps2recomp
         int skippedInvalidRange = 0;
         std::unordered_set<uint32_t> mapStarts;
         std::vector<Function> mapFunctions;
+        // The size column is kept alongside the row so extents can be normalised once every start is known.
+        struct MapRow
+        {
+            Function function;
+            uint32_t declaredSize;
+        };
+        std::vector<MapRow> mapRows;
         while (std::getline(file, line))
         {
             if (line.empty())
@@ -1007,6 +1014,18 @@ namespace ps2recomp
             {
                 uint32_t start = std::stoul(startStr, nullptr, 0);
                 uint32_t end = std::stoul(endStr, nullptr, 0);
+                uint32_t declaredSize = 0u;
+                if (!sizeStr.empty())
+                {
+                    try
+                    {
+                        declaredSize = static_cast<uint32_t>(std::stoul(sizeStr, nullptr, 0));
+                    }
+                    catch (...)
+                    {
+                        declaredSize = 0u;
+                    }
+                }
 
                 const Section *section = FindFunctionSectionByAddress(m_sections, start);
                 if (!section)
@@ -1030,7 +1049,7 @@ namespace ps2recomp
                 func.isStub = false;
                 func.isSkipped = false;
 
-                mapFunctions.push_back(std::move(func));
+                mapRows.push_back(MapRow{std::move(func), declaredSize});
                 mapStarts.insert(start);
                 count++;
             }
@@ -1040,8 +1059,138 @@ namespace ps2recomp
             }
         }
 
-        if (count > 0)
+        // --- Extent normalisation (docs/analyzer-discovery-pass.md) ------------------------------------------
+
+        // The export's End column is unreliable in both directions: some rows run far past their body
+
+        // (FUN_00256bc8 by +109308 bytes, producing a monolith that misdecodes and shadows every address in its
+
+        // range) and some carry a size larger than End-Start (real code attributed to nothing). The size column is
+
+        // the better authority, but a surplus of up to 64 bytes is ordinary alignment padding and is left alone so
+
+        // those rows do not all churn. An extent never crosses the next known start or the section end.
+
+        std::sort(mapRows.begin(), mapRows.end(), [](const MapRow &a, const MapRow &b)
+
+                  { return a.function.start < b.function.start; });
+
+        
+
+        constexpr uint32_t kAlignmentTolerance = 64u;
+
+        uint32_t shrunkExtents = 0u;
+
+        uint32_t extendedExtents = 0u;
+
+        for (size_t i = 0; i < mapRows.size(); ++i)
+
         {
+
+            Function &func = mapRows[i].function;
+
+        
+
+            // Duplicate starts: first row wins, matching how the table is populated.
+
+            if (!mapFunctions.empty() && mapFunctions.back().start == func.start)
+
+            {
+
+                continue;
+
+            }
+
+        
+
+            const uint32_t declared = mapRows[i].declaredSize;
+
+            const Section *section = FindFunctionSectionByAddress(m_sections, func.start);
+
+            uint32_t limit = section ? ClampFunctionEndToSection(section, func.start, 0xFFFFFFFFu) : func.end;
+
+            for (size_t j = i + 1; j < mapRows.size(); ++j)
+
+            {
+
+                if (mapRows[j].function.start > func.start)
+
+                {
+
+                    limit = std::min(limit, mapRows[j].function.start);
+
+                    break;
+
+                }
+
+            }
+
+        
+
+            uint32_t extent = (limit > func.start) ? (limit - func.start) : 0u;
+
+            const uint32_t body = (func.end > func.start) ? (func.end - func.start) : 0u;
+
+            if (declared != 0u)
+
+            {
+
+                if (body > declared + kAlignmentTolerance)
+
+                {
+
+                    extent = declared; // runaway End
+
+                    ++shrunkExtents;
+
+                }
+
+                else if (declared > body)
+
+                {
+
+                    extent = declared; // truncated: the export dropped real code
+
+                    ++extendedExtents;
+
+                }
+
+            }
+
+            if (extent != 0u)
+
+            {
+
+                func.end = func.start + extent;
+
+            }
+
+            mapFunctions.push_back(func);
+
+            mapStarts.insert(func.start);
+
+        }
+
+        count = static_cast<int>(mapFunctions.size());
+
+        if (m_reporter && (shrunkExtents > 0u || extendedExtents > 0u))
+
+        {
+
+            m_reporter->info("ghidra-map", "Normalised function extents from the size column: " +
+
+                                                std::to_string(shrunkExtents) + " runaway, " +
+
+                                                std::to_string(extendedExtents) + " truncated.");
+
+        }
+
+        
+
+        if (count > 0)
+
+        {
+
             m_hasLoadedGhidraMap = true;
             m_ghidraMapStarts = mapStarts;
             if (m_reporter)
