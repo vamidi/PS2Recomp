@@ -96,7 +96,13 @@ namespace ps2_stubs
             g_sifRegs[kSifRegBootStatus] = kSifBootReadyMask;
             g_sifRegs[kSifRegMainAddr] = 0u;
             g_sifRegs[kSifRegSubAddr] = 0u;
-            g_sifRegs[kSifRegMsCom] = 0u;
+            // SIF_REG_MSCOM: "the IOP's command channel is up". A title with its own statically linked
+            // libsif (Tales of Legendia carries one at 0x117540/0x117CA0) polls this, sends a handshake
+            // command and then spins on a guest flag that only its own DMA-completion bookkeeping would
+            // set. There is no IOP behind this register file to answer, and the runtime's SIF DMA path
+            // completes synchronously, so report the channel as already initialised instead of leaving
+            // the guest in an unanswerable wait.
+            g_sifRegs[kSifRegMsCom] = 1u;
         }
 
         bool shouldTraceSifReg(uint32_t reg)
