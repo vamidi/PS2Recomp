@@ -5,6 +5,8 @@
 #include "irx.h"
 #include "spu2.h"
 
+#include "ps2x/iop/iop_host.h"
+
 #include <array>
 #include <cstdint>
 #include <deque>
@@ -27,6 +29,9 @@ namespace ps2x::iop::lle
         // An RPC server the EE has registered, for IOP modules that bind back.
         virtual bool eeServer(uint32_t sid) = 0;
         virtual void log(const std::string &message) = 0;
+        // Host file access for the IOP's file services (ioman), so a module can load what it needs.
+        // Null when the host has no file layer.
+        virtual IopHost *hostFiles() { return nullptr; }
     };
 
     // An IOP running original IRX modules on an R3000A interpreter with a
@@ -195,6 +200,10 @@ namespace ps2x::iop::lle
         uint64_t m_cycle = 0;
 
         std::vector<Handler> m_handlers;
+        // One label per handler, and the index of the handler being dispatched: an unbound import gets its
+        // own entry so a call to it can be named ("cdvdman #6") instead of just "unknown import".
+        std::vector<std::string> m_handlerLabels;
+        uint32_t m_lastHandler = 0;
         std::unordered_map<std::string, std::vector<uint32_t>> m_exports;
         std::map<int32_t, Thread> m_threads;
         std::map<int32_t, Semaphore> m_semaphores;
@@ -205,6 +214,14 @@ namespace ps2x::iop::lle
         std::map<uint32_t, Interrupt> m_interrupts;
         std::vector<uint32_t> m_pendingInterrupts;
         std::map<uint32_t, Server> m_servers;
+        // Open files for the ioman service: IOP descriptor -> host handle and position.
+        struct OpenFile
+        {
+            uint64_t handle = 0u;
+            uint64_t position = 0u;
+        };
+        std::map<int32_t, OpenFile> m_openFiles;
+        int32_t m_nextFileDescriptor = 3; // 0..2 are the standard streams
         std::map<uint32_t, int32_t> m_queues; // RPC queue record -> owning thread
         std::deque<std::shared_ptr<Request>> m_requests;
         std::map<int32_t, std::shared_ptr<Request>> m_active; // by server thread

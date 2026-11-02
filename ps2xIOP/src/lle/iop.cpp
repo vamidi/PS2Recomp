@@ -233,7 +233,10 @@ namespace ps2x::iop::lle
                 break;
             context.pc = context.gpr[31];
             if (code < m_handlers.size())
+            {
+                m_lastHandler = code;
                 (this->*m_handlers[code])(context);
+            }
         }
         m_inInterrupt = nested;
         if (result)
@@ -369,7 +372,10 @@ namespace ps2x::iop::lle
                 const uint32_t code = m_cpu.syscallCode();
                 thread->context.pc = thread->context.gpr[31];
                 if (code < m_handlers.size())
+                {
+                    m_lastHandler = code;
                     (this->*m_handlers[code])(thread->context);
+                }
                 if (thread->dormant || thread->wait != Wait::None)
                     break;
             }

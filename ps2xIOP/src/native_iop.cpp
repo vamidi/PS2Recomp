@@ -39,6 +39,7 @@ namespace ps2x::iop
         }
         bool eeServer(uint32_t sid) override { return host.hasGuestRpcServer(sid); }
         void log(const std::string &message) override { host.log(LogLevel::Info, message); }
+        IopHost *hostFiles() override { return &host; }
 
         // Advance the IOP without an audio device, discarding the samples.
         void stepSilently(uint32_t frames)

@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace ps2x::iop::lle
 {
@@ -68,6 +69,16 @@ namespace ps2x::iop::lle
             {"timrman", 10, "getTimerCounter"}, {"timrman", 20, "setTimerHandler"},
             {"timrman", 22, "setupHardTimer"}, {"timrman", 23, "startHardTimer"},
             {"timrman", 24, "stopHardTimer"},
+            // IOP file services. Modules load their data through these; without them an init that opens a
+            // file stops before it registers its RPC server (LIBSD is the case in Tales of Legendia).
+            {"ioman", 4, "iomanOpen"}, {"ioman", 5, "iomanClose"},
+            {"ioman", 6, "iomanRead"}, {"ioman", 7, "iomanWrite"},
+            {"ioman", 8, "iomanLseek"},
+            {"ioman", 9, "iomanClose"}, {"ioman", 11, "iomanOpen"}, {"ioman", 12, "iomanRead"},
+            {"ioman", 13, "iomanWrite"}, {"ioman", 14, "iomanLseek"},
+            // The IOP has no vblank of its own. A 60 Hz counter off the IOP clock is the stand-in: IxAudio
+            // polls this in a loop, and a constant 0 leaves that loop spinning forever.
+            {"vblank", 5, "vblankCount"},
         };
 
         struct Named
@@ -79,7 +90,9 @@ namespace ps2x::iop::lle
 
     void Iop::installKernel()
     {
-#define PS2X_IOP_HANDLER(name) m_handlers.push_back(&Iop::name);
+#define PS2X_IOP_HANDLER(name)                    \
+    m_handlers.push_back(&Iop::name);             \
+    m_handlerLabels.emplace_back(#name);
 #include "kernel_handlers.inc"
 #undef PS2X_IOP_HANDLER
     }
@@ -100,11 +113,138 @@ namespace ps2x::iop::lle
             if (library == binding.library && ordinal == binding.ordinal)
                 return index(binding.handler);
         m_ee.log("[iop] no kernel service for " + library + " #" + std::to_string(ordinal));
-        return index("unknownImport");
+        // Give each unbound import its own handler entry so a call to it can be named later.
+        m_handlers.push_back(&Iop::unknownImport);
+        m_handlerLabels.push_back(library + " #" + std::to_string(ordinal));
+        return static_cast<uint32_t>(m_handlers.size() - 1u);
     }
 
-    void Iop::unknownImport(CpuContext &c) { ret(c, 0); }
+    void Iop::unknownImport(CpuContext &c)
+    {
+        if (std::getenv("TOL_TRACE_IOP_IMPORTS") != nullptr)
+        {
+            char pc[16];
+            std::snprintf(pc, sizeof(pc), "%08X", c.pc);
+            m_ee.log("[iop] call to unbound import " +
+                     (m_lastHandler < m_handlerLabels.size() ? m_handlerLabels[m_lastHandler]
+                                                             : std::string("?")) +
+                     " from 0x" + pc + " a0=0x" + [&] {
+                         char text[16];
+                         std::snprintf(text, sizeof(text), "%08X", arg(c, 0));
+                         return std::string(text);
+                     }() +
+                     " a1=0x" + [&] {
+                         char text[16];
+                         std::snprintf(text, sizeof(text), "%08X", arg(c, 1));
+                         return std::string(text);
+                     }() +
+                     " a2=0x" + [&] {
+                         char text[16];
+                         std::snprintf(text, sizeof(text), "%08X", arg(c, 2));
+                         return std::string(text);
+                     }());
+        }
+        ret(c, 0);
+    }
     void Iop::noop(CpuContext &c) { ret(c, 0); }
+
+    // IOP file services. Modules that load data from the disc go through these; the host file layer does the
+    // translation, so a "cdrom0:\\..." path resolves exactly as the EE side's does. Read-only for now.
+    void Iop::iomanOpen(CpuContext &c)
+    {
+        IopHost *files = m_ee.hostFiles();
+        const std::string path = readString(arg(c, 0), 256);
+        if (!files || path.empty())
+        {
+            ret(c, static_cast<uint32_t>(-2)); // ENOENT
+            return;
+        }
+        const uint64_t handle = files->openHostFile(files->translateGuestPath(path));
+        if (handle == 0u)
+        {
+            ret(c, static_cast<uint32_t>(-2));
+            return;
+        }
+        const int32_t descriptor = m_nextFileDescriptor++;
+        m_openFiles[descriptor] = OpenFile{handle, 0u};
+        if (std::getenv("TOL_TRACE_IOP_FILEIO") != nullptr)
+            m_ee.log("[iop] ioman open '" + path + "' -> fd " + std::to_string(descriptor));
+        ret(c, static_cast<uint32_t>(descriptor));
+    }
+
+    void Iop::iomanClose(CpuContext &c)
+    {
+        const auto found = m_openFiles.find(static_cast<int32_t>(arg(c, 0)));
+        if (found == m_openFiles.end())
+        {
+            ret(c, static_cast<uint32_t>(-9)); // EBADF
+            return;
+        }
+        if (IopHost *files = m_ee.hostFiles())
+            files->closeHostFile(found->second.handle);
+        m_openFiles.erase(found);
+        ret(c, 0);
+    }
+
+    void Iop::iomanRead(CpuContext &c)
+    {
+        const auto found = m_openFiles.find(static_cast<int32_t>(arg(c, 0)));
+        IopHost *files = m_ee.hostFiles();
+        const uint32_t destination = arg(c, 1);
+        const uint32_t size = arg(c, 2);
+        if (found == m_openFiles.end() || !files || size == 0u)
+        {
+            ret(c, found == m_openFiles.end() ? static_cast<uint32_t>(-9) : 0u);
+            return;
+        }
+        std::vector<uint8_t> data(size);
+        size_t read = 0u;
+        if (!files->readHostFile(found->second.handle, found->second.position, data.data(), size, read))
+        {
+            ret(c, static_cast<uint32_t>(-5)); // EIO
+            return;
+        }
+        for (size_t index = 0; index < read; ++index)
+            m_bus.write8(destination + static_cast<uint32_t>(index), data[index]);
+        found->second.position += read;
+        ret(c, static_cast<uint32_t>(read));
+    }
+
+    void Iop::iomanLseek(CpuContext &c)
+    {
+        const auto found = m_openFiles.find(static_cast<int32_t>(arg(c, 0)));
+        if (found == m_openFiles.end())
+        {
+            ret(c, static_cast<uint32_t>(-9)); // EBADF
+            return;
+        }
+        const int32_t offset = static_cast<int32_t>(arg(c, 1));
+        const uint32_t whence = arg(c, 2);
+        uint64_t base = 0u;
+        if (whence == 1u)
+            base = found->second.position;
+        else if (whence == 2u && m_ee.hostFiles())
+        {
+            uint64_t size = 0u;
+            if (m_ee.hostFiles()->hostFileSize(found->second.handle, size))
+                base = size;
+        }
+        const int64_t target = static_cast<int64_t>(base) + offset;
+        found->second.position = target < 0 ? 0u : static_cast<uint64_t>(target);
+        ret(c, static_cast<uint32_t>(found->second.position));
+    }
+
+    void Iop::iomanWrite(CpuContext &c)
+    {
+        // The host file layer is read-only, and no module in this title writes to the disc.
+        ret(c, static_cast<uint32_t>(-5)); // EIO
+    }
+
+    void Iop::vblankCount(CpuContext &c)
+    {
+        // 60 Hz off the IOP clock (36.864 MHz). Modules that wait for the count to change now progress.
+        ret(c, static_cast<uint32_t>((m_cycle * 60u) / kClock));
+    }
 
     void Iop::functionReturn(CpuContext &c)
     {
