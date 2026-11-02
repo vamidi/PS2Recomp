@@ -112,7 +112,12 @@ namespace ps2_syscalls
             const int priority = static_cast<int>(getRegU32(ctx, 5));
             int oldPriority = 0;
             const int result = ee.changePriority(id, priority, interruptSafe, oldPriority);
-            setReturnS32(ctx, result);
+            // The EE kernel returns the thread's PREVIOUS priority on success, and the error code otherwise. Returning the
+            // status code breaks every caller that saves and restores priority: the game does
+            // `old = ChangeThreadPriority(self, 1)` for a critical section and later restores `old`, which came back as 0
+            // (KE_OK) instead of the real priority. That is the priority inversion recorded in the session-26 notes: the
+            // server threads never get scheduled and the boot stalls.
+            setReturnS32(ctx, result == KE_OK ? oldPriority : result);
             ee.transferIfRequested(interruptSafe);
         }
 
