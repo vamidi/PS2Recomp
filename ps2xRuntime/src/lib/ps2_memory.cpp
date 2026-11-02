@@ -29,6 +29,16 @@ namespace
         return address >= 0x10001000u && address < 0x10001800u;
     }
 
+    // TOL_TRACE_READ_ADDR=0x394378: log reads of one guest address. Generated code computes data addresses at
+    // run time (lui+addiu), so a source grep cannot answer "does the guest ever look at this flag?".
+    uint32_t traceReadAddress()
+    {
+        static const uint32_t address = [] {
+            const char *value = std::getenv("TOL_TRACE_READ_ADDR");
+            return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
+        }();
+        return address;
+    }
     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
     {
         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) > static_cast<uint64_t>(regionSize))
@@ -798,7 +808,15 @@ uint16_t PS2Memory::read16(uint32_t address)
 
 uint32_t PS2Memory::read32(uint32_t address)
 {
-    if (address & 3)
+    if (const uint32_t watched = traceReadAddress(); watched != 0u && (address & 0x1FFFFFFFu) == watched)
+    {
+        static uint32_t sReads = 0u;
+        if (sReads < 40u)
+        {
+            ++sReads;
+            std::fprintf(stderr, "[mem] read32 0x%08x (guest 0x%08x)\n", watched, address);
+        }
+    }    if (address & 3)
     {
         throw std::runtime_error("Unaligned 32-bit read at address: 0x" + std::to_string(address));
     }
@@ -846,6 +864,16 @@ uint32_t PS2Memory::read32(uint32_t address)
 
 uint64_t PS2Memory::read64(uint32_t address)
 {
+    if (const uint32_t watched = traceReadAddress(); watched != 0u && (address & 0x1FFFFFFFu) == watched)
+    {
+        static uint32_t sReads64 = 0u;
+        if (sReads64 < 40u)
+        {
+            ++sReads64;
+            std::fprintf(stderr, "[mem] read64 0x%08x (guest 0x%08x)\n", watched, address);
+        }
+    }
+
     if (address & 7)
     {
         throw std::runtime_error("Unaligned 64-bit read at address: 0x" + std::to_string(address));
