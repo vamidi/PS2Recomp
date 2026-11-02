@@ -397,6 +397,10 @@ namespace ps2x::iop::lle
         thread.dormant = false;
         thread.wakeupCount = 0;
         makeReady(thread, 0u);
+        if (std::getenv("TOL_TRACE_IOP_THREADS") != nullptr)
+        {
+            m_ee.log("[iop] thread " + std::to_string(thread.id) + " started");
+        }
         ret(c, 0);
     }
 
