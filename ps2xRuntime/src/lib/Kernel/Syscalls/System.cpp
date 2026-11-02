@@ -542,17 +542,31 @@ namespace ps2_syscalls
             initialStack = stack;
         }
 
-        scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
-        // Frames grow down from the top of the area, as on the kernel, once the
-        // invocation stacks are carved under it: starting at its bottom ran
-        // DQ8's main thread over the ones its VBlank handlers and movie
-        // callbacks were using. When the guest heap limit or the loaded image
-        // leaves no room under the area, the pool stays inside it, and frames
-        // starting at its bottom, as before, still keep out of the pool.
-        if (stack == 0xFFFFFFFFu && runtime->asyncCallbackStackTop() <= initialStack)
+        // InitMainThread(0x3C) with stack == -1 puts the thread's stack at the END of RDRAM and returns
+        // that end as the initial $sp (db-syscalls: "stack=-1 -> end of RDRAM"). Frames grow down from
+        // it, and initialStack is the bottom of the reserved area.
+        //
+        // The runtime's invocation stacks (interrupt and callback handlers) are carved down from the top
+        // of RDRAM too, so the two must be told apart or the first handler runs on top of the interrupted
+        // thread's live frame. That is exactly what happened here: Tales of Legendia reserves 1 MB, i.e.
+        // its stack bottom sits on the pool floor with no room for the pool, so the Timer-2 handler got
+        // $sp = 0x1FFFFF0 and its frame landed on FUN_00100230's saved $ra - zeroing it. The thread then
+        // returned to pc 0 during heap init and the guest never reached its game loop.
+        //
+        // Hand the top kInvocationStackReserve bytes to the pool and start the guest stack below it; keep
+        // the guest's own bottom when it already leaves that much room.
+        static constexpr uint32_t kInvocationStackReserve = 0x00040000u; // 256 KiB = 16 x 16 KiB stacks
+        const uint32_t poolReserveBase = (PS2_RAM_SIZE - kInvocationStackReserve) & ~0xFu;
+        if (stack == 0xFFFFFFFFu)
         {
+            const bool guestLeavesRoom = initialStack >= poolReserveBase && initialStack < PS2_RAM_SIZE;
+            if (!guestLeavesRoom)
+            {
+                initialStack = poolReserveBase;
+            }
             sp = PS2_RAM_SIZE;
         }
+        scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
         setReturnU32(ctx, sp);
     }
 
