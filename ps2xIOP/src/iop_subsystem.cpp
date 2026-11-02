@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -281,6 +283,10 @@ namespace ps2x::iop
 
     RpcResult IopSubsystem::handleRpc(const RpcRequest &request)
     {
+        // TOL_TRACE_IOP_RPC=1: which of the three rejections applies - no native server for the sid, the
+        // native call itself declining, or no profile route. Without this the caller only sees "unhandled".
+        const bool traceRpc = std::getenv("TOL_TRACE_IOP_RPC") != nullptr;
+
         // A server registered by a native module replaces any high-level one.
         uint32_t record = 0, buffer = 0;
         if (m_impl->native.server(request.sid, record, buffer))
@@ -291,11 +297,56 @@ namespace ps2x::iop
                                                  request.receive.size);
             result.resultAddress = request.receive.address;
             result.serverDispatchPolicy = ServerDispatchPolicy::Suppress;
+            if (traceRpc)
+            {
+                std::fprintf(stderr,
+                             "[iop-rpc] sid=0x%08X fn=0x%X send=0x%08X/%u recv=0x%08X/%u -> native server "
+                             "record=0x%08X buffer=0x%08X handled=%d\n",
+                             request.sid, request.function, request.send.address, request.send.size,
+                             request.receive.address, request.receive.size, record, buffer,
+                             result.handled ? 1 : 0);
+            }
             return result;
         }
         const auto it = m_impl->routes.find(request.sid);
         if (it == m_impl->routes.end() || !it->second)
         {
+            // A module can register its RPC server from a thread it starts, so a sid that is missing now
+            // may appear after some IOP time - and the EE's call is the only thing driving that time.
+            // Once a sid has been given that chance and still has no server, stop paying for it: the guest
+            // retries these in loops.
+            static std::unordered_set<uint32_t> sUnservedSids;
+            if (m_impl->native.enabled() && sUnservedSids.count(request.sid) == 0u)
+            {
+                for (int attempt = 0; attempt < 8 && !m_impl->native.server(request.sid, record, buffer);
+                     ++attempt)
+                {
+                    m_impl->native.pump(1024u);
+                }
+                if (m_impl->native.server(request.sid, record, buffer))
+                {
+                    RpcResult result;
+                    result.handled = m_impl->native.call(request.sid, request.function, request.send.address,
+                                                         request.send.size, request.receive.address,
+                                                         request.receive.size);
+                    result.resultAddress = request.receive.address;
+                    result.serverDispatchPolicy = ServerDispatchPolicy::Suppress;
+                    if (traceRpc)
+                    {
+                        std::fprintf(stderr,
+                                     "[iop-rpc] sid=0x%08X fn=0x%X -> server appeared after pump, handled=%d\n",
+                                     request.sid, request.function, result.handled ? 1 : 0);
+                    }
+                    return result;
+                }
+                sUnservedSids.insert(request.sid);
+            }
+            if (traceRpc)
+            {
+                std::fprintf(stderr,
+                             "[iop-rpc] sid=0x%08X fn=0x%X -> NO native server and no route (unhandled)\n",
+                             request.sid, request.function);
+            }
             return {};
         }
         return it->second->handleRpc(request);

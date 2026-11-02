@@ -32,6 +32,9 @@ namespace ps2x::iop
 
         // A server a native module registered, with its record and receive buffer.
         bool server(uint32_t sid, uint32_t &record, uint32_t &buffer) const;
+        // Runs the IOP for a few audio frames without an output device. A module can register its RPC
+        // server from a thread it starts, so a sid that is not there yet may appear after some IOP time.
+        void pump(uint32_t frames = 64u);
         // Blocking SIF RPC. The reply is written to receiveAddress in EE memory.
         bool call(uint32_t sid, uint32_t function, uint32_t sendAddress, uint32_t sendSize,
                   uint32_t receiveAddress, uint32_t receiveSize);

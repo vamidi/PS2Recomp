@@ -129,6 +129,14 @@ namespace ps2x::iop
         return m_impl->iop.server(sid, record, buffer);
     }
 
+    void NativeIop::pump(uint32_t frames)
+    {
+        std::lock_guard lock(m_impl->mutex);
+        m_impl->iop.settle();
+        m_impl->stepSilently(frames);
+        m_impl->iop.settle();
+    }
+
     bool NativeIop::call(uint32_t sid, uint32_t function, uint32_t sendAddress, uint32_t sendSize,
                          uint32_t receiveAddress, uint32_t receiveSize)
     {

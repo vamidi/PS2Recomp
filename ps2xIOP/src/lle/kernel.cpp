@@ -352,6 +352,16 @@ namespace ps2x::iop::lle
             return;
         }
         m_threads[thread.id] = thread;
+        if (std::getenv("TOL_TRACE_IOP_THREADS") != nullptr)
+        {
+            m_ee.log("[iop] thread " + std::to_string(thread.id) + " created entry=0x" +
+                     [&] {
+                         char text[16];
+                         std::snprintf(text, sizeof(text), "%08X", thread.entry);
+                         return std::string(text);
+                     }() +
+                     " prio=" + std::to_string(thread.priority));
+        }
         ret(c, static_cast<uint32_t>(thread.id));
     }
 
