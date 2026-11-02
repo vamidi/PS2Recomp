@@ -352,10 +352,12 @@ int PS2IopTransport::bootIopImage(PS2Runtime *runtime, const std::vector<uint8_t
         return -1; // not a romdir container
     }
 
-    // Modules the LLE kernel emulates itself (sysmem, loadcore, sifman/sifcmd, threadman, ioman, fileio,
-    // timrman, sysclib, stdio). Their kernel-side counterparts must not be loaded on top.
+    // Modules the LLE kernel emulates itself (sysmem, loadcore, sifman/sifcmd, threadman, timrman, sysclib,
+    // stdio). Their kernel-side counterparts must not be loaded on top. IOMAN and FILEIO are deliberately
+    // NOT skipped: they are servers, not kernel primitives - IOMAN answers the ioman RPC (sid 0x80000001)
+    // that the game's sceSifInitIoman binds, and FILEIO provides the devices behind it.
     static const char *kEmulated[] = {"RESET", "ROMDIR", "EXTINFO", "SYSMEM", "LOADCORE", "SIFCMD", "SIFMAN",
-                                      "THREADMAN", "IOMAN", "FILEIO", "TIMEMANI", "SYSCLIB", "STDIO"};
+                                      "THREADMAN", "TIMEMANI", "SYSCLIB", "STDIO"};
     const auto emulated = [](const std::string &name)
     {
         for (const char *candidate : kEmulated)
