@@ -2369,6 +2369,22 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
+    // TOL_TRACE_SPIN=1: backward branches land here with ctx->pc already set to the loop target, so a
+    // bounded sample names the function the guest is spinning inside when nothing is dispatching.
+    if (std::getenv("TOL_TRACE_SPIN") != nullptr)
+    {
+        static uint64_t sCalls = 0u;
+        ++sCalls;
+        if ((sCalls % 200000u) == 0u)
+        {
+            const R5900Context *context = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+            if (context)
+            {
+                std::cerr << "[spin] pc=0x" << std::hex << context->pc << " ra=0x" << getRegU32(context, 31)
+                          << std::dec << " branches=" << sCalls << std::endl;
+            }
+        }
+    }
     return m_eeScheduler->checkpointDue(cycles);
 }
 
