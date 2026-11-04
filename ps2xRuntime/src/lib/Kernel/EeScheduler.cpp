@@ -299,6 +299,23 @@ namespace
         return enabled;
     }
 
+    struct DispatchStats
+    {
+        uint64_t count = 0u;
+        double totalMs = 0.0;
+        double maxMs = 0.0;
+        int maxTid = 0;
+        std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
+    };
+
+    DispatchStats gDispatchStats;
+
+    bool dispatchStatsEnabled()
+    {
+        static const bool enabled = std::getenv("TOL_TRACE_EE_DISPATCH") != nullptr;
+        return enabled;
+    }
+
     // True at most once a second, and only when the tracing is on.
     bool threadTableDumpDue()
     {
@@ -2283,7 +2300,49 @@ void EeScheduler::enterGuest(GuestThread &thread)
     m_activeFiber = thread.fiber.get();
     m_dispatchedThreadId = thread.id;
     thread.inGuestCall = true;
+    const int dispatchedTid = thread.id;
+    const uint32_t turnStartPc = thread.activeContext().pc;
+    const uint64_t turnStartCycle = m_eeCycle;
+    const auto dispatchStart = std::chrono::steady_clock::now();
     m_activeFiber->resume();
+    const auto dispatchEnd = std::chrono::steady_clock::now();
+    if (dispatchStatsEnabled())
+    {
+        // How much does one guest turn cost, and how many do we get per second? A few turns a second at
+        // milliseconds each means the recompiled code on that path is the cost; hundreds of sub-millisecond
+        // turns means the scheduler's own overhead is.
+        const double ms = std::chrono::duration<double, std::milli>(dispatchEnd - dispatchStart).count();
+        // A long turn is pure guest execution; its entry and exit pcs bracket the code that ate the time.
+        static uint32_t sLongTurns = 0u;
+        if (ms > 5.0 && sLongTurns < 40u && m_exitedThread.empty())
+        {
+            ++sLongTurns;
+            const R5900Context &live = thread.activeContext();
+            std::fprintf(stderr,
+                         "[eeturn] tid=%d %.2f ms cycles=%llu start=0x%08X end=0x%08X ra=0x%08X sp=0x%08X\n",
+                         dispatchedTid, ms, static_cast<unsigned long long>(m_eeCycle - turnStartCycle),
+                         turnStartPc, live.pc, getRegU32(&live, 31), getRegU32(&live, 29));
+        }
+        ++gDispatchStats.count;
+        gDispatchStats.totalMs += ms;
+        if (ms > gDispatchStats.maxMs)
+        {
+            gDispatchStats.maxMs = ms;
+            gDispatchStats.maxTid = dispatchedTid;
+        }
+        const double window =
+            std::chrono::duration<double>(dispatchEnd - gDispatchStats.windowStart).count();
+        if (window >= 1.0)
+        {
+            std::fprintf(stderr, "[eedispatch] %.1f/s mean=%.3f ms max=%.3f ms (tid=%d) over %llu turns\n",
+                         static_cast<double>(gDispatchStats.count) / window,
+                         gDispatchStats.totalMs / static_cast<double>(gDispatchStats.count),
+                         gDispatchStats.maxMs, gDispatchStats.maxTid,
+                         static_cast<unsigned long long>(gDispatchStats.count));
+            gDispatchStats = DispatchStats{};
+            gDispatchStats.windowStart = dispatchEnd;
+        }
+    }
     m_activeFiber = previous;
     // Cleared by the fiber when a dispatch finishes; still set means it
     // suspended part way through and its stack is waiting to be resumed.
