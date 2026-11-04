@@ -31,6 +31,12 @@ namespace ps2x::iop::lle
         };
         ReadTrace gReadTrace;
 
+        // Starvation guard state (see pickThread): the thread currently monopolising the interpreter, and how
+        // long it has run without blocking.
+        int gHogThread = -1;
+        int gLastPick = -1;
+        uint32_t gPickStreak = 0u;
+
         void traceRead(void *context, uint32_t address, unsigned bytes, uint32_t value)
         {
             auto &trace = *static_cast<ReadTrace *>(context);
@@ -52,6 +58,23 @@ namespace ps2x::iop::lle
                          trace.thread, trace.context != nullptr ? trace.context->pc : 0u, address,
                          address & 0x1FFFFFFFu, bytes, value, static_cast<unsigned long long>(count));
         }
+
+        // Counterpart for stores: who updates the mixer's block descriptors (0xF34xx) and source pointers
+        // (0x43xxx)? If nothing writes them, the producer that should is missing.
+        void traceWrite(void *context, uint32_t address, unsigned bytes, uint32_t value)
+        {
+            (void)context;
+            const uint32_t physical = address & 0x1FFFFFFFu;
+            const bool wanted = (physical >= 0x000F3400u && physical < 0x000F3700u) ||
+                                (physical >= 0x00043000u && physical < 0x00043400u);
+            if (!wanted)
+                return;
+            static uint32_t sLines = 0u;
+            if (++sLines > 120u)
+                return;
+            std::fprintf(stderr, "[write] tid=%d pc=0x%08X addr=0x%08X %ub = 0x%X\n", gReadTrace.thread,
+                         gReadTrace.context != nullptr ? gReadTrace.context->pc : 0u, address, bytes, value);
+        }
     }
 
     Iop::Iop(EeLink &ee) : m_ee(ee), m_bus(*this), m_cpu(m_bus), m_spu2(*this)
@@ -61,6 +84,11 @@ namespace ps2x::iop::lle
         {
             m_bus.readHook = &traceRead;
             m_bus.readHookContext = &gReadTrace;
+        }
+        if (std::getenv("TOL_TRACE_IOP_WRITES") != nullptr)
+        {
+            m_bus.writeHook = &traceWrite;
+            m_bus.writeHookContext = &gReadTrace;
         }
         uint8_t *ram = m_bus.ram();
         // Threads and handlers return here; the trap tells the kernel they are done.
@@ -365,15 +393,40 @@ namespace ps2x::iop::lle
 
     Iop::Thread *Iop::pickThread()
     {
+        // Starvation guard. This port has no timer preemption, so a module thread that never blocks keeps the
+        // interpreter forever: measured, the IxAudio mixer (prio 39) never yields and KORG's RPC server thread
+        // (prio 99) never executes, which stalls sound init and therefore the whole boot. After a thread has
+        // run a long uninterrupted stretch, prefer any other ready thread over it until it blocks again.
         Thread *best = nullptr;
+        Thread *runnerUp = nullptr;
         for (auto &[id, thread] : m_threads)
         {
             if (thread.dormant || thread.wait != Wait::None)
                 continue;
             if (!best || thread.priority < best->priority ||
                 (thread.priority == best->priority && thread.readySequence < best->readySequence))
+            {
+                runnerUp = best;
                 best = &thread;
+            }
+            else if (!runnerUp || thread.priority < runnerUp->priority ||
+                     (thread.priority == runnerUp->priority && thread.readySequence < runnerUp->readySequence))
+            {
+                runnerUp = &thread;
+            }
         }
+        if (gHogThread != -1)
+        {
+            const auto hog = m_threads.find(gHogThread);
+            if (hog == m_threads.end() || hog->second.dormant || hog->second.wait != Wait::None)
+            {
+                gHogThread = -1;
+                gPickStreak = 0u;
+                gLastPick = -1;
+            }
+        }
+        if (best != nullptr && gHogThread == best->id && runnerUp != nullptr)
+            return runnerUp;
         return best;
     }
 
@@ -417,6 +470,17 @@ namespace ps2x::iop::lle
             ran = true;
             gReadTrace.context = &thread->context;
             gReadTrace.thread = thread->id;
+            // Starvation accounting: a thread that keeps being picked without ever blocking is a hog.
+            if (thread->id == gLastPick)
+            {
+                if (++gPickStreak > 8u)
+                    gHogThread = thread->id;
+            }
+            else
+            {
+                gLastPick = thread->id;
+                gPickStreak = 0u;
+            }
             if (std::getenv("TOL_TRACE_IOP_RPC") != nullptr)
             {
                 static uint32_t sPicks = 0u;
@@ -434,7 +498,14 @@ namespace ps2x::iop::lle
                     break;
                 if (reason == StopReason::Fault)
                 {
-                    m_ee.log("[iop] thread " + std::to_string(thread->id) + " stopped on an unsupported instruction");
+                    const uint32_t faultPc = m_cpu.faultPc();
+                    const uint32_t faultWord = m_bus.read32(faultPc);
+                    char address[16];
+                    char word[16];
+                    std::snprintf(address, sizeof(address), "%08X", faultPc);
+                    std::snprintf(word, sizeof(word), "%08X", faultWord);
+                    m_ee.log("[iop] thread " + std::to_string(thread->id) + " stopped on an unsupported instruction" +
+                             " pc=0x" + address + " word=0x" + word);
                     thread->dormant = true;
                     reschedule();
                     break;

@@ -50,6 +50,11 @@ namespace ps2x::iop::lle
 
         // Debug hook: called after every load with the address and the value it returned. Null in normal runs.
         using ReadHook = void (*)(void *context, uint32_t address, unsigned bytes, uint32_t value);
+        // Debug hook: called after every store with the address and the value written. Null in normal runs.
+        using WriteHook = void (*)(void *context, uint32_t address, unsigned bytes, uint32_t value);
+        WriteHook writeHook = nullptr;
+        void *writeHookContext = nullptr;
+
         ReadHook readHook = nullptr;
         void *readHookContext = nullptr;
 
@@ -80,6 +85,8 @@ namespace ps2x::iop::lle
                 std::memcpy(&m_scratchpad[physical & (0x400u - Bytes)], &value, Bytes);
             else
                 m_io.ioWrite(physical, value, Bytes);
+            if (writeHook != nullptr)
+                writeHook(writeHookContext, address, Bytes, value);
         }
 
         IoDevice &m_io;
