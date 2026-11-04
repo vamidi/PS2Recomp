@@ -19,11 +19,49 @@ namespace ps2x::iop::lle
         constexpr uint32_t kSpuLine = 9u;
 
         uint32_t syscallWord(uint32_t code) { return 0x0000000Cu | (code << 6); }
+
+        // Debug-only load tracing (TOL_TRACE_IOP_READS): what the currently running thread reads, sampled.
+        // A thread that never blocks but keeps the CPU busy is either polling a hardware register or a RAM
+        // flag; the sampled address (and the pc that reads it) says which.
+        struct ReadTrace
+        {
+            const CpuContext *context = nullptr;
+            int thread = -1;
+            uint64_t reads = 0u;
+        };
+        ReadTrace gReadTrace;
+
+        void traceRead(void *context, uint32_t address, unsigned bytes, uint32_t value)
+        {
+            auto &trace = *static_cast<ReadTrace *>(context);
+            const uint64_t count = ++trace.reads;
+            static const int sWanted = [] {
+                const char *text = std::getenv("TOL_TRACE_IOP_READS");
+                const int value = (text != nullptr) ? std::atoi(text) : 25;
+                return value > 0 ? value : 25;
+            }();
+            if (trace.thread != sWanted)
+                return;
+            if ((count % 64u) != 0u)
+                return;
+            static uint32_t sLines = 0u;
+            if (sLines >= 120u)
+                return;
+            ++sLines;
+            std::fprintf(stderr, "[read] tid=%d pc=0x%08X addr=0x%08X phys=0x%08X %ub -> 0x%X (reads=%llu)\n",
+                         trace.thread, trace.context != nullptr ? trace.context->pc : 0u, address,
+                         address & 0x1FFFFFFFu, bytes, value, static_cast<unsigned long long>(count));
+        }
     }
 
     Iop::Iop(EeLink &ee) : m_ee(ee), m_bus(*this), m_cpu(m_bus), m_spu2(*this)
     {
         installKernel();
+        if (std::getenv("TOL_TRACE_IOP_READS") != nullptr)
+        {
+            m_bus.readHook = &traceRead;
+            m_bus.readHookContext = &gReadTrace;
+        }
         uint8_t *ram = m_bus.ram();
         // Threads and handlers return here; the trap tells the kernel they are done.
         m_returnTrap = kTrapBase;
@@ -361,6 +399,8 @@ namespace ps2x::iop::lle
             m_current = thread->id;
             m_reschedule = false;
             ran = true;
+            gReadTrace.context = &thread->context;
+            gReadTrace.thread = thread->id;
             if (std::getenv("TOL_TRACE_IOP_RPC") != nullptr)
             {
                 static uint32_t sPicks = 0u;

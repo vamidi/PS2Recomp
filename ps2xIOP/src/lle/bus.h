@@ -27,7 +27,19 @@ namespace ps2x::iop::lle
         uint8_t *ram() { return m_ram.data(); }
         const uint8_t *ram() const { return m_ram.data(); }
 
-        uint32_t fetch(uint32_t address) { return read32(address); }
+        // Instruction fetches bypass the read hook: they flood it and are not what a polling loop spins on.
+        uint32_t fetch(uint32_t address)
+        {
+            const uint32_t physical = address & 0x1FFFFFFFu;
+            uint32_t value = 0;
+            if (physical < 0x00800000u)
+                std::memcpy(&value, &m_ram[physical & (kRamBytes - 4u)], 4);
+            else if ((physical & ~0x3FFu) == 0x1F800000u)
+                std::memcpy(&value, &m_scratchpad[physical & (0x400u - 4u)], 4);
+            else
+                value = m_io.ioRead(physical, 4);
+            return value;
+        }
 
         uint8_t read8(uint32_t address) { return static_cast<uint8_t>(read<1>(address)); }
         uint16_t read16(uint32_t address) { return static_cast<uint16_t>(read<2>(address)); }
@@ -35,6 +47,11 @@ namespace ps2x::iop::lle
         void write8(uint32_t address, uint8_t value) { write<1>(address, value); }
         void write16(uint32_t address, uint16_t value) { write<2>(address, value); }
         void write32(uint32_t address, uint32_t value) { write<4>(address, value); }
+
+        // Debug hook: called after every load with the address and the value it returned. Null in normal runs.
+        using ReadHook = void (*)(void *context, uint32_t address, unsigned bytes, uint32_t value);
+        ReadHook readHook = nullptr;
+        void *readHookContext = nullptr;
 
     private:
         template <unsigned Bytes>
@@ -48,6 +65,8 @@ namespace ps2x::iop::lle
                 std::memcpy(&value, &m_scratchpad[physical & (0x400u - Bytes)], Bytes);
             else
                 value = m_io.ioRead(physical, Bytes);
+            if (readHook != nullptr)
+                readHook(readHookContext, address, Bytes, value);
             return value;
         }
 
