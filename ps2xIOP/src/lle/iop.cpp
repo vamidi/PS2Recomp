@@ -30,6 +30,10 @@ namespace ps2x::iop::lle
             uint64_t reads = 0u;
         };
         ReadTrace gReadTrace;
+        // The return traps live in the low page, which a module loaded at base 0 clears with its .bss. Keep the
+        // words cached so they can be rewritten before anything runs (measured: the RPC trap read 0x00000000).
+        uint32_t gReturnTrapWord = 0u;
+        uint32_t gRpcTrapWord = 0u;
 
         // Starvation guard state (see pickThread): the thread currently monopolising the interpreter, and how
         // long it has run without blocking.
@@ -94,10 +98,10 @@ namespace ps2x::iop::lle
         // Threads and handlers return here; the trap tells the kernel they are done.
         m_returnTrap = kTrapBase;
         const uint32_t returnWord = syscallWord(handlerFor("", 1));
-        std::memcpy(ram + kTrapBase, &returnWord, 4);
+        std::memcpy(ram + kTrapBase, &returnWord, 4);        gReturnTrapWord = returnWord;
         m_rpcTrap = kTrapBase + 8u;
         const uint32_t rpcWord = syscallWord(handlerFor("", 2));
-        std::memcpy(ram + m_rpcTrap, &rpcWord, 4);
+        std::memcpy(ram + m_rpcTrap, &rpcWord, 4);        gRpcTrapWord = rpcWord;
         // The ctype table sysclib hands out: bit 2 digit, 1 lower, 0 upper, 3 space, 6 hex.
         m_ctypeTable = kCtypeBase;
         for (uint32_t ch = 0; ch < 256u; ++ch)
@@ -453,6 +457,14 @@ namespace ps2x::iop::lle
 
     bool Iop::runThreads(uint64_t budget, bool advanceClock)
     {
+        // A module loaded at base 0 clears the low page with its .bss, which erased the return traps: at fault
+        // time the RPC trap word read 0x00000000, so a handler returning to it executed zeros instead of the
+        // syscall. Keep both trap words valid before anything runs.
+        {
+            uint8_t *ram = m_bus.ram();
+            std::memcpy(ram + m_returnTrap, &gReturnTrapWord, 4);
+            std::memcpy(ram + m_rpcTrap, &gRpcTrapWord, 4);
+        }
         // Only the sample clock moves time. Work done off it, answering an
         // RPC the moment it arrives, would otherwise run the timers fast.
         uint64_t offClock = 0;
@@ -509,6 +521,19 @@ namespace ps2x::iop::lle
                     const auto active = m_active.find(thread->id);
                     if (active != m_active.end())
                     {
+                        // Where did the return actually go? ra at fault vs the trap we set, and the word the
+                        // trap address holds: if ra != trap the return address was corrupted inside the
+                        // handler; if ra == trap the resume path is what lands at the bad pc.
+                        char raText[16];
+                        char spText[16];
+                        char trapText[16];
+                        char trapWord[16];
+                        std::snprintf(raText, sizeof(raText), "%08X", thread->context.gpr[31]);
+                        std::snprintf(spText, sizeof(spText), "%08X", thread->context.gpr[29]);
+                        std::snprintf(trapText, sizeof(trapText), "%08X", m_rpcTrap);
+                        std::snprintf(trapWord, sizeof(trapWord), "%08X", m_bus.read32(m_rpcTrap));
+                        m_ee.log(std::string("[iop] rpc fault tid=") + std::to_string(thread->id) + " ra=0x" + raText +
+                                 " sp=0x" + spText + " trap=0x" + trapText + " trapWord=0x" + trapWord);
                         // The handler returned somewhere other than its RPC return trap (measured: pc 0x117C,
                         // in the kernel's own ctype area). The work is done and the reply is in the server
                         // buffer, so deliver that and put the thread back in its RPC loop rather than losing
@@ -657,7 +682,6 @@ namespace ps2x::iop::lle
             c.gpr[5] = server->second.buffer;
             c.gpr[6] = static_cast<uint32_t>(request.send.size());
             c.gpr[29] -= 64u;
-            c.gpr[31] = m_rpcTrap;
             c.branchPending = false;
             c.loadRegister = 0;
             m_active[thread.id] = *it;
