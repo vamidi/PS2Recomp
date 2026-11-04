@@ -203,18 +203,46 @@ namespace ps2x::iop
         std::unique_lock lock(m_impl->mutex);
         if (!m_impl->iop.hasServer(sid))
             return false;
+        const bool traceCallTime = std::getenv("TOL_TRACE_IOP_CALL_TIME") != nullptr;
+        const auto callEntry = std::chrono::steady_clock::now();
         m_impl->iop.submit(request);
         m_impl->iop.settle();
+        const auto afterSettle = std::chrono::steady_clock::now();
         // Most commands finish at once; the rest wait for IOP time to pass.
-        const auto started = std::chrono::steady_clock::now();
+        const auto started = afterSettle;
         const auto deadline = started + std::chrono::seconds(2);
+        uint32_t iterations = 0u;
+        double waitMs = 0.0;
         while (!request->done && std::chrono::steady_clock::now() < deadline)
         {
+            ++iterations;
+            const auto waitStart = std::chrono::steady_clock::now();
             if (m_impl->audioRunning())
                 m_impl->progressed.wait_for(lock, std::chrono::milliseconds(20));
             else
                 m_impl->stepSilently(480u);
+            waitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
             m_impl->iop.settle();
+        }
+        if (traceCallTime)
+        {
+            // Split the call: setup (submit + first settle, i.e. delivering to the server thread), the wait
+            // loop (its sleeps and how many laps), and the tail.
+            static uint32_t sCallTimeLogs = 0u;
+            if (sCallTimeLogs < 40u)
+            {
+                ++sCallTimeLogs;
+                const auto now = std::chrono::steady_clock::now();
+                auto ms = [](auto from, auto to)
+                { return std::chrono::duration<double, std::milli>(to - from).count(); };
+                m_impl->host.log(LogLevel::Warning,
+                                 "[iop-call-time] sid=" + std::to_string(sid) + " fn=" + std::to_string(function) +
+                                     " total=" + std::to_string(ms(callEntry, now)) +
+                                     " setup=" + std::to_string(ms(callEntry, afterSettle)) +
+                                     " wait=" + std::to_string(waitMs) + " loops=" + std::to_string(iterations) +
+                                     " audio=" + (m_impl->audioRunning() ? "1" : "0") +
+                                     " done=" + (request->done ? "1" : "0"));
+            }
         }
         // TOL_TRACE_IOP_CALL=1: name every IOP RPC and whether it completed, with its wall time. A "timed out"
         // line only appears when the server EXISTS but never answers, so this is what distinguishes "no provider"

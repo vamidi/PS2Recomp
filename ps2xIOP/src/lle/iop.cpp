@@ -645,7 +645,21 @@ namespace ps2x::iop::lle
     {
         deliverRequests();
         // Enough for any command handler; threads spinning on hardware stop here.
-        runThreads(2'000'000u, false);
+        //
+        // Run in slices instead of one 2,000,000-cycle block: when an RPC is in flight the handler normally
+        // finishes in a few thousand cycles, and burning the rest of the budget afterwards cost ~25 ms of
+        // host time per call (measured: 28 ms per KORG fn 0x0A, of which the handler was ~2 ms).
+        const bool hadActive = !m_active.empty();
+        uint64_t remaining = 2'000'000u;
+        while (remaining != 0u)
+        {
+            const uint64_t slice = std::min<uint64_t>(remaining, 16384u);
+            if (!runThreads(slice, false))
+                break;
+            remaining -= slice;
+            if (hadActive && m_active.empty())
+                break;
+        }
     }
 
     void Iop::step(int16_t &left, int16_t &right)
