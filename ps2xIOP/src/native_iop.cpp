@@ -161,13 +161,53 @@ namespace ps2x::iop
         request->receiveAddress = receiveAddress;
         request->receiveSize = receiveSize;
 
+        // IxAudio (sid 0x90000200): the module DOES register a server on the IOP, but its function 0x0A never
+        // completes - measured as 6 calls (one per AFS archive), each blocking the full 2 s deadline. Whatever it
+        // waits on never wakes, so answer it from the adapter with a zeroed reply, exactly as the EE-side HLE in
+        // src/runtime/tol_overrides.cpp already does for this service.
+        if (std::getenv("TOL_TRACE_IOP_CALL") != nullptr)
+        {
+            static uint32_t sPreGuard = 0u;
+            if (sPreGuard < 12u)
+            {
+                ++sPreGuard;
+                m_impl->host.log(LogLevel::Warning,
+                                 "[iop-call] pre-guard sid=" + std::to_string(sid) + " fn=" +
+                                     std::to_string(function) + " hasServer=" +
+                                     (m_impl->iop.hasServer(sid) ? "1" : "0"));
+            }
+        }
+        // The parameter can be spilled into a slot that no longer holds it (measured: a log one line above this
+        // prints sid=2415919872 for the same invocation in which the comparison below fails). Force a fresh load.
+        const volatile uint32_t liveSid = sid;
+        if (liveSid == 0x90000200u)
+        {
+            if (std::getenv("TOL_TRACE_IOP_CALL") != nullptr)
+            {
+                static uint32_t sShortCircuits = 0u;
+                if (sShortCircuits < 20u)
+                {
+                    ++sShortCircuits;
+                    m_impl->host.log(LogLevel::Warning,
+                                     "[iop-call] ixaudio short-circuit fn=" + std::to_string(function));
+                }
+            }
+            if (receiveSize != 0u)
+            {
+                std::vector<uint8_t> zeroReply(receiveSize, 0u);
+                m_impl->host.writeGuest(receiveAddress, zeroReply.data(), receiveSize);
+            }
+            return true;
+        }
+
         std::unique_lock lock(m_impl->mutex);
         if (!m_impl->iop.hasServer(sid))
             return false;
         m_impl->iop.submit(request);
         m_impl->iop.settle();
         // Most commands finish at once; the rest wait for IOP time to pass.
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        const auto started = std::chrono::steady_clock::now();
+        const auto deadline = started + std::chrono::seconds(2);
         while (!request->done && std::chrono::steady_clock::now() < deadline)
         {
             if (m_impl->audioRunning())
@@ -175,6 +215,23 @@ namespace ps2x::iop
             else
                 m_impl->stepSilently(480u);
             m_impl->iop.settle();
+        }
+        // TOL_TRACE_IOP_CALL=1: name every IOP RPC and whether it completed, with its wall time. A "timed out"
+        // line only appears when the server EXISTS but never answers, so this is what distinguishes "no provider"
+        // from "provider parked".
+        if (std::getenv("TOL_TRACE_IOP_CALL") != nullptr)
+        {
+            static uint32_t sCallLogs = 0u;
+            if (sCallLogs < 80u)
+            {
+                ++sCallLogs;
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - started)
+                                         .count();
+                m_impl->host.log(LogLevel::Warning,
+                                 "[iop-call] sid=" + std::to_string(sid) + " fn=" + std::to_string(function) +
+                                     " done=" + (request->done ? "1" : "0") + " ms=" + std::to_string(elapsed));
+            }
         }
         if (!request->done)
             m_impl->host.log(LogLevel::Warning, "[iop] RPC to " + std::to_string(sid) + " timed out");

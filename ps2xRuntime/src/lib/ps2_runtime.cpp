@@ -305,6 +305,27 @@ namespace
 
     void raiseCop0Exception(R5900Context *ctx, uint32_t exceptionCode, bool tlbRefill = false)
     {
+        // TOL_TRACE_EXC=1: the runtime vectors every unhandled exception to the EE kernel's general vector
+        // (0x80000080), which this port does not recompile - so an exception is a dead end and the guest's
+        // loading sequence silently loses the call it was in. Log the code and the faulting pc/ra so the
+        // offender is named instead of guessed.
+        if (std::getenv("TOL_TRACE_EXC") != nullptr)
+        {
+            static uint32_t sExceptions = 0u;
+            ++sExceptions;
+            if (sExceptions <= 40u || (sExceptions % 256u) == 0u)
+            {
+                std::cerr << "[exc] code=" << exceptionCode
+                          << " pc=0x" << std::hex << ctx->pc
+                          << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+                          << " sp=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0))
+                          << " v0=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[2], 0))
+                          << " v1=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[3], 0))
+                          << " a0=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0))
+                          << std::dec << " total=" << sExceptions << std::endl;
+            }
+        }
+
         if (ctx->in_delay_slot)
         {
             ctx->cop0_epc = ctx->branch_pc;
@@ -322,6 +343,23 @@ namespace
         ctx->cop0_status |= COP0_STATUS_EXL;
         ctx->pc = selectExceptionVector(ctx, tlbRefill);
         ctx->in_delay_slot = false;
+    }
+
+    // TOL_TRACE_EXC=1 companion (see raiseCop0Exception): the guest pc alone does not say which address the
+    // memory model refused, and "address error" covers unaligned, out-of-range and TLB misses alike.
+    void traceRejectedAccess(const R5900Context *ctx, uint32_t vaddr, const char *what)
+    {
+        if (std::getenv("TOL_TRACE_EXC") == nullptr)
+        {
+            return;
+        }
+        static uint32_t sCount = 0u;
+        if (++sCount > 64u)
+        {
+            return;
+        }
+        std::cerr << "[exc-mem] " << what << " addr=0x" << std::hex << vaddr << " pc=0x" << ctx->pc << " ra=0x"
+                  << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)) << std::dec << std::endl;
     }
 
     std::filesystem::path normalizeAbsolutePath(const std::filesystem::path &path)
@@ -1589,6 +1627,24 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
 
     const bool syscallHandled = ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this);
 
+    // Thread syscalls (0x20..0x2B) are logged without the 150-line budget and without the general filter: they are
+    // rare, they decide whether the guest ever becomes multi-threaded, and a failure here is silent (a negative
+    // return that most callers ignore). Turn on with TOL_TRACE_SYSCALL=1.
+    if (traceSyscall && syscallId >= 0x20u && syscallId <= 0x7Fu)
+    {
+        static uint32_t sThreadSyscallLogs = 0u;
+        if (sThreadSyscallLogs < 400u)
+        {
+            ++sThreadSyscallLogs;
+            const int32_t threadReturn = static_cast<int32_t>(getRegU32(ctx, 2));
+            std::cerr << "[thread-syscall] 0x" << std::hex << "0x" << syscallId << " a0=0x" << syscallA0
+                      << " a1=0x" << syscallA1 << " a2=0x" << syscallA2 << " a3=0x" << syscallA3
+                      << " -> v0=" << std::dec << threadReturn << (threadReturn < 0 ? " ERROR" : "")
+                      << " handled=" << (syscallHandled ? 1 : 0) << " at=0x" << std::hex << syscallSite
+                      << " ra=0x" << syscallRa << std::dec << std::endl;
+        }
+    }
+
     if (traceSyscall)
     {
         static uint32_t sSyscallLogs = 0u;
@@ -2179,6 +2235,7 @@ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
     catch (const std::exception &)
     {
+        traceRejectedAccess(ctx, vaddr, "load");
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
         return 0;
     }
@@ -2192,6 +2249,7 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
     catch (const std::exception &)
     {
+        traceRejectedAccess(ctx, vaddr, "load");
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
         return 0;
     }
@@ -2205,6 +2263,7 @@ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
     catch (const std::exception &)
     {
+        traceRejectedAccess(ctx, vaddr, "load");
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
         return 0;
     }
@@ -2218,6 +2277,7 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
     catch (const std::exception &)
     {
+        traceRejectedAccess(ctx, vaddr, "load");
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
         return 0;
     }
@@ -2245,6 +2305,7 @@ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8
     }
     catch (const std::exception &)
     {
+        traceRejectedAccess(ctx, vaddr, "store");
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
     }
 }
@@ -2258,6 +2319,7 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     }
     catch (const std::exception &)
     {
+        traceRejectedAccess(ctx, vaddr, "store");
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
     }
 }
@@ -2272,6 +2334,7 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     }
     catch (const std::exception &)
     {
+        traceRejectedAccess(ctx, vaddr, "store");
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
     }
 }
@@ -2285,6 +2348,7 @@ void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     }
     catch (const std::exception &)
     {
+        traceRejectedAccess(ctx, vaddr, "store");
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
     }
 }
@@ -2300,6 +2364,7 @@ void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m
     }
     catch (const std::exception &)
     {
+        traceRejectedAccess(ctx, vaddr, "store");
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
     }
 }
