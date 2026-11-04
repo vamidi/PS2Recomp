@@ -1,6 +1,7 @@
 #include "iop.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -9,6 +10,12 @@
 
 namespace ps2x::iop::lle
 {
+    // TOL_TRACE_KORG_TIME: one KORG fn 0x0A round trip, timed end to end. The gap between consecutive submits
+    // is the part the EE spends between calls; the IOP cycle delta is the work the round trip itself costs.
+    static std::chrono::steady_clock::time_point gKorgSubmitWall;
+    static std::chrono::steady_clock::time_point gKorgPreviousSubmitWall;
+    static uint64_t gKorgSubmitCycle = 0u;
+
     namespace
     {
         constexpr uint32_t kTrapBase = 0x1000u;       // return traps, one word each
@@ -666,7 +673,26 @@ namespace ps2x::iop::lle
         return true;
     }
 
-    void Iop::submit(std::shared_ptr<Request> request) { m_requests.push_back(std::move(request)); }
+    void Iop::submit(std::shared_ptr<Request> request)
+    {
+        if (request->sid == 0x90000300u && request->function == 0x0Au)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (gKorgPreviousSubmitWall.time_since_epoch().count() != 0)
+            {
+                const double gap = std::chrono::duration<double, std::milli>(now - gKorgPreviousSubmitWall).count();
+                static uint32_t sGaps = 0u;
+                if (++sGaps <= 12u)
+                {
+                    std::fprintf(stderr, "[korgtime] gap since previous submit = %.2f ms\n", gap);
+                }
+            }
+            gKorgPreviousSubmitWall = now;
+            gKorgSubmitWall = now;
+            gKorgSubmitCycle = m_cycle;
+        }
+        m_requests.push_back(std::move(request));
+    }
 
     void Iop::deliverRequests()
     {
@@ -787,7 +813,32 @@ namespace ps2x::iop::lle
             readMemory(resultAddress, reply.data(), request.receiveSize);
             m_ee.writeEe(request.receiveAddress, reply.data(), request.receiveSize);
         }
-        if (request.sid == 0x90000300u)        {            const uint32_t reply = resultAddress != 0u ? m_bus.read32(resultAddress) : 0u;            char text[128];            std::snprintf(text, sizeof(text), "[iop] korg fn=%u reply@0x%08X=0x%08X", request.function, resultAddress, reply);            m_ee.log(text);        }        request.done = true;
+        if (request.sid == 0x90000300u)
+        {
+            // This used to print every reply; it fires ~25x a second forever, so cap it and put the timing
+            // behind TOL_TRACE_KORG_TIME instead.
+            static uint32_t sKorgReplies = 0u;
+            if (++sKorgReplies <= 4u)
+            {
+                const uint32_t reply = resultAddress != 0u ? m_bus.read32(resultAddress) : 0u;
+                char text[128];
+                std::snprintf(text, sizeof(text), "[iop] korg fn=%u reply@0x%08X=0x%08X", request.function,
+                              resultAddress, reply);
+                m_ee.log(text);
+            }
+            if (request.function == 0x0Au && std::getenv("TOL_TRACE_KORG_TIME") != nullptr)
+            {
+                static uint32_t sRoundTrips = 0u;
+                if (++sRoundTrips <= 20u)
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    const double ms = std::chrono::duration<double, std::milli>(now - gKorgSubmitWall).count();
+                    std::fprintf(stderr, "[korgtime] round trip #%u wall=%.3f ms iopCycles=%llu\n", sRoundTrips, ms,
+                                 static_cast<unsigned long long>(m_cycle - gKorgSubmitCycle));
+                }
+            }
+        }
+        request.done = true;
         m_active.erase(active);
         thread.context = m_saved[thread.id];
         thread.wait = Wait::Rpc;

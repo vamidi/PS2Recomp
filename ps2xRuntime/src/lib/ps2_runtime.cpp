@@ -1647,6 +1647,22 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
 
     if (traceSyscall)
     {
+        // Which syscall eats the wall clock? The steady-state loop only calls a handful per second, so log
+        // the ones whose handler (plus the guest work leading to them) took more than 5 ms.
+        static auto previousCall = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const double deltaMs = std::chrono::duration<double, std::milli>(now - previousCall).count();
+        previousCall = now;
+        static uint32_t sSlowLogs = 0u;
+        if (deltaMs > 5.0 && sSlowLogs < 200u)
+        {
+            ++sSlowLogs;
+            const int32_t slowReturn = static_cast<int32_t>(getRegU32(ctx, 2));
+            std::cerr << "[slowsyscall] 0x" << std::hex << syscallId << " a0=0x" << syscallA0 << " a1=0x"
+                      << syscallA1 << " a2=0x" << syscallA2 << " -> v0=" << std::dec << slowReturn
+                      << " after " << deltaMs << " ms at=0x" << std::hex << syscallSite << " ra=0x" << syscallRa
+                      << std::dec << std::endl;
+        }
         static uint32_t sSyscallLogs = 0u;
         if (sSyscallLogs < 150u)
         {
