@@ -3,6 +3,10 @@
 #include "../../ps2_iop_transport.h"
 #include "runtime/ps2_native_iop.h"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
 namespace ps2_syscalls
 {
     namespace
@@ -347,6 +351,17 @@ namespace ps2_syscalls
     {
         std::lock_guard<std::recursive_mutex> rpcCallLock(g_sif_call_rpc_mutex);
 
+        // TOL_TRACE_RPC_STAGE=1: where the wall time goes inside one call - request construction,
+        // handleRpc (the IOP round trip) and the reply/debug tail.
+        const bool traceStages = std::getenv("TOL_TRACE_RPC_STAGE") != nullptr;
+        const auto stageEntry = std::chrono::steady_clock::now();
+        static uint32_t sStageSeq = 0u;
+        const uint32_t stageSeq = ++sStageSeq;
+        auto stageMs = [](auto from, auto to)
+        { return std::chrono::duration<double, std::milli>(to - from).count(); };
+        std::chrono::steady_clock::time_point stageBeforeCall{};
+        std::chrono::steady_clock::time_point stageAfterCall{};
+
         const uint32_t clientPtr = getRegU32(ctx, 4);
         const uint32_t rpcNum = getRegU32(ctx, 5);
         const uint32_t mode = getRegU32(ctx, 6);
@@ -547,7 +562,16 @@ namespace ps2_syscalls
             request.endFunction = endFunction;
             request.endParameter = endParameter;
 
+            stageBeforeCall = std::chrono::steady_clock::now();
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+            stageAfterCall = std::chrono::steady_clock::now();
+            if (traceStages && stageSeq <= 60u)
+            {
+                std::fprintf(stderr,
+                             "[rpcstage] #%u sid=0x%08X fn=0x%X setup=%.3f handleRpc=%.3f send=%u recv=%u\n",
+                             stageSeq, sid, rpcNum, stageMs(stageEntry, stageBeforeCall),
+                             stageMs(stageBeforeCall, stageAfterCall), sendSize, receiveSize);
+            }
 
             if (iopResult.signalNowaitCompletion &&
                 (mode & kSifRpcModeNowait) != 0u)
@@ -649,6 +673,14 @@ namespace ps2_syscalls
                 }
 #endif
                 pushSifRpcDebugEvent(event);
+                if (traceStages && stageSeq <= 60u)
+                {
+                    const auto stageNow = std::chrono::steady_clock::now();
+                    std::fprintf(stderr,
+                                 "[rpcstage] #%u sid=0x%08X fn=0x%X reply=%.3f total=%.3f handled=%d\n",
+                                 stageSeq, sid, rpcNum, stageMs(stageAfterCall, stageNow),
+                                 stageMs(stageEntry, stageNow), handled ? 1 : 0);
+                }
             };
 
             setReturnS32(&parent, 0);
