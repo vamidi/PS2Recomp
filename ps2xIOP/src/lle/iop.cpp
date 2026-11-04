@@ -645,6 +645,39 @@ namespace ps2x::iop::lle
             const bool active = owner != m_threads.end() && m_active.count(owner->first) != 0u;
             const bool deliverable =
                 owner != m_threads.end() && owner->second.wait == Wait::Rpc && !active;
+            if ((*it)->sid == 0x90000300u)
+            {
+                // KORG's dispatcher (0xB5B0) reads a jump table at 0xDCCC with `lui at,1; lw v0,-0x2334(at)`,
+                // i.e. at the LINK address, while the module is loaded at base+0. Compare what the dispatcher
+                // would read with the relocated copy and with the expected handler (base + 0xA070).
+                static uint32_t sDispatch = 0u;
+                if (sDispatch < 8u)
+                {
+                    ++sDispatch;
+                    const uint32_t base = server->second.function - 0xB5B0u;
+                    const uint32_t function = (*it)->function;
+                    const uint32_t tableLink = 0xDCCCu + function * 4u;
+                    const uint32_t tableReloc = base + tableLink;
+                    char text[384];
+                    std::snprintf(text, sizeof(text),
+                                  "[iop] korg dispatch fn=%u dispatcher=0x%08X base=0x%08X"
+                                  " absTable[0x%08X]=0x%08X relTable[0x%08X]=0x%08X expected=0x%08X lui@%08X=0x%08X lw@%08X=0x%08X",
+                                  function, server->second.function, base, tableLink, m_bus.read32(tableLink),
+                                  tableReloc, m_bus.read32(tableReloc), base + 0xA070u, base + 0xB5CCu,
+                                  m_bus.read32(base + 0xB5CCu), base + 0xB5D4u,
+                                  m_bus.read32(base + 0xB5D4u));
+                    const uint32_t luiWord = m_bus.read32(base + 0xB5CCu);
+                    const uint32_t lwWord = m_bus.read32(base + 0xB5D4u);
+                    const uint32_t at = ((luiWord & 0xFFFFu) << 16) + function * 4u;
+                    const uint32_t effective =
+                        at + static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(lwWord & 0xFFFFu)));
+                    char extra[160];
+                    std::snprintf(extra, sizeof(extra), " | dispatcherReads[0x%08X]=0x%08X", effective,
+                                  m_bus.read32(effective));
+                    m_ee.log(extra);
+                    m_ee.log(text);
+                }
+            }
             if (std::getenv("TOL_TRACE_IOP_RPC") != nullptr)
             {
                 static uint32_t sLogged = 0u;
