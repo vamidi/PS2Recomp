@@ -455,6 +455,10 @@ private:
     [[nodiscard]] bool hasReadyAtOrAbovePriority(int priority) const;
     void renewTimeSlice();
     void copyMainContextToRuntime();
+    // TOL_TRACE_EE_THREADS=1: once a second, print every thread's state, the wait it is parked on and its
+    // registers, plus the semaphore/event-flag tables. Answers "which thread is stuck and on what" without
+    // having to guess from the syscall stream.
+    void dumpThreadTable();
 
     PS2Runtime &m_runtime;
     uint8_t *m_rdram = nullptr;

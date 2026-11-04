@@ -245,6 +245,108 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     publishSnapshotNow();
 }
 
+namespace
+{
+    const char *threadTableStatusName(EeThreadStatus status)
+    {
+        switch (status)
+        {
+        case EeThreadStatus::Running: return "Running";
+        case EeThreadStatus::Ready: return "Ready";
+        case EeThreadStatus::Waiting: return "Waiting";
+        case EeThreadStatus::WaitingSuspended: return "WaitSusp";
+        case EeThreadStatus::Suspended: return "Suspended";
+        case EeThreadStatus::Dormant: return "Dormant";
+        }
+        return "?";
+    }
+
+    const char *threadTableWaitName(EeWaitReason reason)
+    {
+        switch (reason)
+        {
+        case EeWaitReason::None: return "-";
+        case EeWaitReason::Sleep: return "sleep";
+        case EeWaitReason::Semaphore: return "sema";
+        case EeWaitReason::EventFlag: return "evflag";
+        case EeWaitReason::VSync: return "vsync";
+        case EeWaitReason::External: return "external";
+        case EeWaitReason::Mpeg: return "mpeg";
+        }
+        return "?";
+    }
+
+    int threadTableWaitId(const EeWaitState &wait)
+    {
+        if (const auto *semaphore = std::get_if<EeSemaphoreWait>(&wait.payload))
+        {
+            return semaphore->id;
+        }
+        if (const auto *flag = std::get_if<EeEventFlagWait>(&wait.payload))
+        {
+            return flag->id;
+        }
+        if (const auto *external = std::get_if<EeExternalWait>(&wait.payload))
+        {
+            return static_cast<int>(external->type);
+        }
+        return 0;
+    }
+
+    bool threadTableEnabled()
+    {
+        static const bool enabled = std::getenv("TOL_TRACE_EE_THREADS") != nullptr;
+        return enabled;
+    }
+
+    // True at most once a second, and only when the tracing is on.
+    bool threadTableDumpDue()
+    {
+        if (!threadTableEnabled())
+        {
+            return false;
+        }
+        static auto next = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next)
+        {
+            return false;
+        }
+        next = now + std::chrono::seconds(1);
+        return true;
+    }
+}
+
+void EeScheduler::dumpThreadTable()
+{
+    std::fprintf(stderr, "[eethreads] cycle=%llu running=%d threads=%zu sema=%zu evf=%zu\n",
+                 static_cast<unsigned long long>(m_eeCycle), m_currentThreadId, m_threads.size(),
+                 m_semaphores.size(), m_eventFlags.size());
+    for (auto &entry : m_threads)
+    {
+        GuestThread &guest = entry.second;
+        const R5900Context &registers = guest.activeContext();
+        std::fprintf(stderr,
+                     "[eethreads]   tid=%3d %-9s wait=%-8s id=%-3d prio=%3d/%3d susp=%d wake=%u "
+                     "pc=0x%08X ra=0x%08X sp=0x%08X entry=0x%08X\n",
+                     guest.id, threadTableStatusName(guest.status), threadTableWaitName(guest.wait.reason),
+                     threadTableWaitId(guest.wait), guest.currentPriority, guest.initialPriority,
+                     guest.suspendCount, guest.wakeupCount, registers.pc, getRegU32(&registers, 31),
+                     getRegU32(&registers, 29), guest.entry);
+    }
+    for (auto &entry : m_semaphores)
+    {
+        std::fprintf(stderr, "[eethreads]   sem id=%d count=%d/%d init=%d waiters=%zu\n", entry.second.id,
+                     entry.second.count, entry.second.maxCount, entry.second.initCount,
+                     entry.second.waiters.size());
+    }
+    for (auto &entry : m_eventFlags)
+    {
+        std::fprintf(stderr, "[eethreads]   evf id=%d bits=0x%08X init=0x%08X waiters=%zu\n", entry.second.id,
+                     entry.second.bits, entry.second.initBits, entry.second.waiters.size());
+    }
+}
+
 void EeScheduler::run()
 {
     assertExecutor();
@@ -253,6 +355,10 @@ void EeScheduler::run()
     while (!m_stopRequested.load(std::memory_order_acquire))
     {
         g_eeRunLoopIterations.fetch_add(1u, std::memory_order_relaxed);
+        if (threadTableDumpDue())
+        {
+            dumpThreadTable();
+        }
         // Service events and preemption once between guest turns.
         processPendingEvents();
         if (m_stopRequested.load(std::memory_order_acquire))
@@ -268,6 +374,12 @@ void EeScheduler::run()
                 // About to sleep: nothing after this would service a pending
                 // snapshot request until the guest runs again.
                 publishSnapshotNow();
+                // The table is most useful precisely when the scheduler has nothing to run, so dump it here
+                // too - otherwise a fully parked guest would never print one.
+                if (threadTableDumpDue())
+                {
+                    dumpThreadTable();
+                }
                 waitForEvent();
                 continue;
             }
