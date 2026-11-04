@@ -730,7 +730,16 @@ namespace ps2x::iop::lle
             c.gpr[4] = request.function;
             c.gpr[5] = server->second.buffer;
             c.gpr[6] = static_cast<uint32_t>(request.send.size());
-            c.gpr[29] -= 64u;
+            // Deliver with a proper O32 call frame: 32 bytes, 8-byte aligned, with the return trap stored in
+            // the standard slot as well as in $ra, so a handler that spills and reloads $ra still comes back
+            // to the kernel instead of jumping through whatever happened to be on the stack.
+            c.gpr[29] = (c.gpr[29] - 0x20u) & ~7u;
+            {
+                uint8_t *ram = m_bus.ram();
+                const uint32_t returnTrap = m_rpcTrap;
+                std::memcpy(ram + c.gpr[29] + 0x10u, &returnTrap, 4);
+            }
+            c.gpr[31] = m_rpcTrap;
             c.branchPending = false;
             c.loadRegister = 0;
             m_active[thread.id] = *it;
