@@ -2155,6 +2155,18 @@ void EeScheduler::enterGuest(GuestThread &thread)
 
     assert(m_activeFiber == nullptr && "guest fibers must not nest");
     g_eeEnterGuestCount.fetch_add(1u, std::memory_order_relaxed);
+    // Where does the guest actually live? A sparse sample of the dispatch pc names the loop that never lets a
+    // frame finish; without it the audio/SIF traces only show the calls the loop happens to make.
+    if (std::getenv("TOL_TRACE_EE_PC") != nullptr)
+    {
+        static uint64_t sample = 0u;
+        if ((++sample % 25u) == 0u)
+        {
+            const R5900Context &probe = thread.activeContext();
+            std::fprintf(stderr, "[eepc] tid=%d pc=0x%08X ra=0x%08X sp=0x%08X\n", thread.id, probe.pc,
+                         getRegU32(&probe, 31), getRegU32(&probe, 29));
+        }
+    }
     EeFiber *previous = m_activeFiber;
     m_activeFiber = thread.fiber.get();
     m_dispatchedThreadId = thread.id;
