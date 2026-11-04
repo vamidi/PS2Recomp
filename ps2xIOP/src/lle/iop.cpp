@@ -89,6 +89,8 @@ namespace ps2x::iop::lle
             m_bus.readHook = &traceRead;
             m_bus.readHookContext = &gReadTrace;
         }
+        if (std::getenv("TOL_TRACE_IOP_PC") != nullptr)
+            m_cpu.setPcTrace(true);
         if (std::getenv("TOL_TRACE_IOP_WRITES") != nullptr)
         {
             m_bus.writeHook = &traceWrite;
@@ -534,6 +536,17 @@ namespace ps2x::iop::lle
                         std::snprintf(trapWord, sizeof(trapWord), "%08X", m_bus.read32(m_rpcTrap));
                         m_ee.log(std::string("[iop] rpc fault tid=") + std::to_string(thread->id) + " ra=0x" + raText +
                                  " sp=0x" + spText + " trap=0x" + trapText + " trapWord=0x" + trapWord);
+                        {
+                            std::string trail = "[iop] pc trail:";
+                            const uint32_t count = std::min<uint32_t>(m_cpu.tracePcCount(), 16u);
+                            for (uint32_t back = count; back-- > 0u;)
+                            {
+                                char entry[16];
+                                std::snprintf(entry, sizeof(entry), " %08X", m_cpu.tracePc(back));
+                                trail += entry;
+                            }
+                            m_ee.log(trail);
+                        }
                         // The handler returned somewhere other than its RPC return trap (measured: pc 0x117C,
                         // in the kernel's own ctype area). The work is done and the reply is in the server
                         // buffer, so deliver that and put the thread back in its RPC loop rather than losing

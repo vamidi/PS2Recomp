@@ -14,6 +14,8 @@ namespace ps2x::iop::lle
         while (cycles < budget)
         {
             const uint32_t pc = c.pc;
+            if (m_pcTrace)
+                m_pcRing[m_pcCount++ & 31u] = pc;
             const uint32_t op = m_bus.fetch(pc);
             ++cycles;
 

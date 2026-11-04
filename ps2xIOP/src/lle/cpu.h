@@ -39,6 +39,10 @@ namespace ps2x::iop::lle
 
         uint32_t syscallCode() const noexcept { return m_syscallCode; }
         uint32_t faultPc() const noexcept { return m_faultPc; }
+        // Debug: ring of the last executed pcs, so a fault can be dumped with the code path that led to it.
+        void setPcTrace(bool on) noexcept { m_pcTrace = on; }
+        uint32_t tracePc(unsigned back) const noexcept { return m_pcRing[(m_pcCount - 1u - back) & 31u]; }
+        uint32_t tracePcCount() const noexcept { return m_pcCount; }
         uint32_t cop0Status() const noexcept { return m_status; }
         void setCop0Status(uint32_t status) noexcept { m_status = status; }
 
@@ -47,5 +51,8 @@ namespace ps2x::iop::lle
         uint32_t m_syscallCode = 0;
         uint32_t m_faultPc = 0;
         uint32_t m_status = 0;
+        bool m_pcTrace = false;
+        uint32_t m_pcRing[32]{};
+        uint32_t m_pcCount = 0;
     };
 }
