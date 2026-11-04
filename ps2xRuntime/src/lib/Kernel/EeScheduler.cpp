@@ -8,12 +8,14 @@
 #include <atomic>
 #include <bit>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -307,6 +309,16 @@ namespace
         int maxTid = 0;
         std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
     };
+
+    struct TurnBucket
+    {
+        uint64_t count = 0u;
+        double totalMs = 0.0;
+    };
+
+    // Turn cost grouped by entry pc: which guest function is actually burning the EE thread. The
+    // long-turn list only shows outliers; the steady state lives below its threshold.
+    std::map<uint32_t, TurnBucket> gTurnBuckets;
 
     DispatchStats gDispatchStats;
 
@@ -2325,6 +2337,11 @@ void EeScheduler::enterGuest(GuestThread &thread)
         }
         ++gDispatchStats.count;
         gDispatchStats.totalMs += ms;
+        {
+            TurnBucket &bucket = gTurnBuckets[turnStartPc];
+            ++bucket.count;
+            bucket.totalMs += ms;
+        }
         if (ms > gDispatchStats.maxMs)
         {
             gDispatchStats.maxMs = ms;
@@ -2339,6 +2356,19 @@ void EeScheduler::enterGuest(GuestThread &thread)
                          gDispatchStats.totalMs / static_cast<double>(gDispatchStats.count),
                          gDispatchStats.maxMs, gDispatchStats.maxTid,
                          static_cast<unsigned long long>(gDispatchStats.count));
+            // Top entry points by total time, with how much of the second each accounted for.
+            std::vector<std::pair<uint32_t, TurnBucket>> ranked(gTurnBuckets.begin(), gTurnBuckets.end());
+            std::sort(ranked.begin(), ranked.end(),
+                      [](const auto &left, const auto &right) { return left.second.totalMs > right.second.totalMs; });
+            const size_t shown = std::min<size_t>(ranked.size(), 8u);
+            for (size_t index = 0; index < shown; ++index)
+            {
+                const TurnBucket &bucket = ranked[index].second;
+                std::fprintf(stderr, "    [turnbucket] pc=0x%08X %llu turns %7.1f ms (%3.0f%% of the second)\n",
+                             ranked[index].first, static_cast<unsigned long long>(bucket.count), bucket.totalMs,
+                             bucket.totalMs / (std::max(1e-3, window) * 1000.0) * 100.0);
+            }
+            gTurnBuckets.clear();
             gDispatchStats = DispatchStats{};
             gDispatchStats.windowStart = dispatchEnd;
         }
