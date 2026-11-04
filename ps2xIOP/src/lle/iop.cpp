@@ -69,12 +69,15 @@ namespace ps2x::iop::lle
         {
             (void)context;
             const uint32_t physical = address & 0x1FFFFFFFu;
-            const bool wanted = (physical >= 0x000F3400u && physical < 0x000F3700u) ||
-                                (physical >= 0x00043000u && physical < 0x00043400u);
+            // Also every store into the KORG server thread's stack, so the dispatcher's saved-$ra slot can be
+            // watched for overwrites (the frame sits around 0xDB228..0xDB2B0).
+            const bool wanted = (physical >= 0x000DB000u && physical < 0x000DC000u) && true &&
+                                (physical >= 0x00043000u && physical < 0x00043400u) ||
+                                (physical >= 0x000DB000u && physical < 0x000DC000u);
             if (!wanted)
                 return;
             static uint32_t sLines = 0u;
-            if (++sLines > 120u)
+            if (++sLines > 20000u)
                 return;
             std::fprintf(stderr, "[write] tid=%d pc=0x%08X addr=0x%08X %ub = 0x%X\n", gReadTrace.thread,
                          gReadTrace.context != nullptr ? gReadTrace.context->pc : 0u, address, bytes, value);
