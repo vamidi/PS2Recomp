@@ -506,6 +506,17 @@ namespace ps2x::iop::lle
                     std::snprintf(word, sizeof(word), "%08X", faultWord);
                     m_ee.log("[iop] thread " + std::to_string(thread->id) + " stopped on an unsupported instruction" +
                              " pc=0x" + address + " word=0x" + word);
+                    const auto active = m_active.find(thread->id);
+                    if (active != m_active.end())
+                    {
+                        // The handler returned somewhere other than its RPC return trap (measured: pc 0x117C,
+                        // in the kernel's own ctype area). The work is done and the reply is in the server
+                        // buffer, so deliver that and put the thread back in its RPC loop rather than losing
+                        // the server thread - a lost server thread makes every later call hang.
+                        const auto server = m_servers.find(active->second->sid);
+                        finishRequest(*thread, server != m_servers.end() ? server->second.buffer : 0u);
+                        break;
+                    }
                     thread->dormant = true;
                     reschedule();
                     break;
