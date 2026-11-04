@@ -1083,10 +1083,22 @@ namespace ps2x::iop::lle
         server.function = arg(c, 2);
         server.buffer = arg(c, 3);
         server.queue = arg(c, 6);
+        bool queueKnown = false;
         for (const auto &[queue, owner] : m_queues)
             if (queue == server.queue)
+            {
                 server.thread = owner;
+                queueKnown = true;
+            }
         m_servers[server.sid] = server;
+        if (std::getenv("TOL_TRACE_IOP_RPC") != nullptr)
+        {
+            std::fprintf(stderr,
+                         "[sifrpc] register sid=0x%08X handler=0x%08X buff=0x%08X queue=0x%08X record=0x%08X"
+                         " -> thread=%d queueKnown=%d\n",
+                         server.sid, server.function, server.buffer, server.queue, server.record,
+                         static_cast<int>(server.thread), queueKnown ? 1 : 0);
+        }
         m_ee.log("[iop] RPC server " + std::to_string(server.sid) + " registered");
         ret(c, 0);
     }
@@ -1094,6 +1106,11 @@ namespace ps2x::iop::lle
     void Iop::sifSetRpcQueue(CpuContext &c)
     {
         m_queues[arg(c, 0)] = static_cast<int32_t>(arg(c, 1));
+        if (std::getenv("TOL_TRACE_IOP_RPC") != nullptr)
+        {
+            std::fprintf(stderr, "[sifrpc] setQueue queue=0x%08X -> thread=%d\n", arg(c, 0),
+                         static_cast<int>(arg(c, 1)));
+        }
         ret(c, 0);
     }
 

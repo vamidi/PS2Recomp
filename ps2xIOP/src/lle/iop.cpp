@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <tuple>
@@ -360,6 +361,16 @@ namespace ps2x::iop::lle
             m_current = thread->id;
             m_reschedule = false;
             ran = true;
+            if (std::getenv("TOL_TRACE_IOP_RPC") != nullptr)
+            {
+                static uint32_t sPicks = 0u;
+                if ((++sPicks % 2048u) == 0u && sPicks <= 2048u * 30u)
+                {
+                    std::fprintf(stderr, "[sifrpc] pick thread=%d prio=%d pc=0x%08X ready=%u\n",
+                                 static_cast<int>(thread->id), static_cast<int>(thread->priority),
+                                 thread->context.pc, thread->readySequence);
+                }
+            }
             while (!m_reschedule && clock < end)
             {
                 const StopReason reason = m_cpu.run(thread->context, clock, end);
@@ -458,12 +469,40 @@ namespace ps2x::iop::lle
             const auto server = m_servers.find((*it)->sid);
             if (server == m_servers.end())
             {
+                if (std::getenv("TOL_TRACE_IOP_RPC") != nullptr)
+                {
+                    std::fprintf(stderr, "[sifrpc] request sid=0x%08X fn=0x%08X -> NO SERVER\n", (*it)->sid,
+                                 (*it)->function);
+                }
                 (*it)->done = true; // nobody serves it; the EE side falls back
                 it = m_requests.erase(it);
                 continue;
             }
             const auto owner = m_threads.find(server->second.thread);
-            if (owner == m_threads.end() || owner->second.wait != Wait::Rpc || m_active.count(owner->first) != 0u)
+            const bool active = owner != m_threads.end() && m_active.count(owner->first) != 0u;
+            const bool deliverable =
+                owner != m_threads.end() && owner->second.wait == Wait::Rpc && !active;
+            if (std::getenv("TOL_TRACE_IOP_RPC") != nullptr)
+            {
+                static uint32_t sLogged = 0u;
+                if (sLogged < 60u)
+                {
+                    ++sLogged;
+                    // handler here is the pointer the server registered: if it is 0 or the owning thread is
+                    // not parked in sifRpcLoop the request can never be delivered.
+                    std::fprintf(stderr,
+                                 "[sifrpc] request sid=0x%08X fn=0x%08X -> handler=0x%08X buff=0x%08X thread=%d"
+                                 " wait=%d active=%d pc=0x%08X deliver=%s\n",
+                                 (*it)->sid, (*it)->function, server->second.function, server->second.buffer,
+                                 static_cast<int>(server->second.thread),
+                                 owner == m_threads.end() ? -1 : static_cast<int>(owner->second.wait),
+                                 active ? 1 : 0, owner == m_threads.end() ? 0u : owner->second.context.pc,
+                                 deliverable ? "yes"
+                                             : (owner == m_threads.end() ? "no(thread missing)"
+                                                                         : (active ? "no(busy)" : "no(not parked)")));
+                }
+            }
+            if (!deliverable)
             {
                 ++it;
                 continue;
