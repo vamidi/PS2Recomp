@@ -177,7 +177,23 @@ namespace ps2x::iop::lle
     {
         if (physical >= 0x1F900000u && physical < 0x1F900800u)
         {
-            m_spu2.write(physical & 0x7FFu, static_cast<uint16_t>(value));
+            const uint32_t offset = physical & 0x7FFu;
+            if (std::getenv("TOL_TRACE_SPU2") != nullptr)
+            {
+                // 0x1A8/0x1AA TSA (transfer address), 0x1AC DATA, 0x1B0 ADMAS (AutoDMA mode).
+                if (offset == 0x1A8u || offset == 0x1AAu || offset == 0x1B0u || offset == 0x1B2u)
+                {
+                    std::fprintf(stderr, "[spu2] write off=0x%03X val=0x%04X (pc=0x%08X)\n", offset,
+                                 value & 0xFFFFu, current() != nullptr ? current()->context.pc : 0u);
+                }
+                else if (offset == 0x1ACu)
+                {
+                    static uint32_t sData = 0u;
+                    if ((++sData % 512u) == 0u)
+                        std::fprintf(stderr, "[spu2] data write x%u val=0x%04X\n", sData, value & 0xFFFFu);
+                }
+            }
+            m_spu2.write(offset, static_cast<uint16_t>(value));
             if (bytes == 4u)
                 m_spu2.write((physical + 2u) & 0x7FFu, static_cast<uint16_t>(value >> 16));
             return;
