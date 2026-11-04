@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -658,9 +660,15 @@ namespace ps2x::iop::detail
                 lastError = kCdvdErrorNone;
                 return true;
             }
+            const bool trace = std::getenv("TOL_TRACE_CDVD") != nullptr;
             const uint64_t byteCount64 = static_cast<uint64_t>(sectors) * kSectorSize;
             if (byteCount64 > IopMemory::RamSize || !memory.ownsRamRange(destination, static_cast<size_t>(byteCount64)))
             {
+                if (trace)
+                {
+                    std::fprintf(stderr, "[cdvd] read reject=ram-range lsn=%u sectors=%u dest=0x%08X\n", lsn,
+                                 sectors, destination);
+                }
                 lastError = kCdvdErrorRead;
                 return false;
             }
@@ -668,33 +676,91 @@ namespace ps2x::iop::detail
             std::vector<uint8_t> bytes(byteCount, 0u);
 
             bool read = false;
+            const char *reason = "no-image";
+            uint64_t imageBytes = 0u;
             const std::string imagePath = host.hostPath(HostPathKind::CdImage);
             if (!imagePath.empty())
             {
+                std::error_code sizeError;
+                imageBytes = static_cast<uint64_t>(std::filesystem::file_size(imagePath, sizeError));
+                if (sizeError)
+                {
+                    imageBytes = 0u;
+                }
                 if (imageHandle == 0u)
                     imageHandle = host.openHostFile(imagePath);
                 if (imageHandle != 0u)
                 {
                     size_t bytesRead = 0u;
-                    read = host.readHostFile(imageHandle,
-                                             static_cast<uint64_t>(lsn) * kSectorSize,
-                                             bytes.data(),
-                                             byteCount,
-                                             bytesRead) &&
-                           bytesRead == byteCount;
+                    if (host.readHostFile(imageHandle,
+                                          static_cast<uint64_t>(lsn) * kSectorSize,
+                                          bytes.data(),
+                                          byteCount,
+                                          bytesRead))
+                    {
+                        if (bytesRead == byteCount)
+                        {
+                            read = true;
+                            reason = "image";
+                        }
+                        else
+                        {
+                            reason = "short-read";
+                        }
+                    }
+                    else
+                    {
+                        reason = "read-failed";
+                    }
+                    if (!read && imageBytes != 0u &&
+                        static_cast<uint64_t>(lsn) * kSectorSize >= imageBytes)
+                    {
+                        reason = "past-eof";
+                    }
+                }
+                else
+                {
+                    reason = "open-failed";
                 }
             }
 
             if (!read && buildVirtualIso())
             {
                 read = true;
+                reason = "virtual-iso";
                 for (uint32_t sector = 0u; sector < sectors; ++sector)
                 {
                     if (!readVirtualSector(lsn + sector, bytes.data() + static_cast<size_t>(sector) * kSectorSize))
                     {
                         read = false;
+                        reason = "virtual-miss";
                         break;
                     }
+                }
+            }
+
+            // Past the end of our dump: a retail disc is larger than the image we have, so the sector simply
+            // is not here. Serving zeros keeps the streaming reader moving instead of failing the whole
+            // transfer with a drive error it cannot recover from.
+            const bool pastEnd =
+                imageBytes != 0u &&
+                static_cast<uint64_t>(lsn) * kSectorSize + byteCount64 > imageBytes;
+            if (!read && pastEnd)
+            {
+                read = true;
+                reason = "past-eof-zero-filled";
+            }
+
+            if (trace)
+            {
+                static uint32_t sLogs = 0u;
+                if (sLogs < 40u || !read)
+                {
+                    ++sLogs;
+                    std::fprintf(stderr,
+                                 "[cdvd] read lsn=%u sectors=%u dest=0x%08X image=%llu bytes ok=%d reason=%s\n", lsn,
+                                 sectors, destination, static_cast<unsigned long long>(imageBytes), read ? 1 : 0,
+                                 reason);
                 }
             }
 
