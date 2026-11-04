@@ -222,6 +222,24 @@ namespace ps2x::iop::lle
                 {
                     std::fprintf(stderr, "[spu2] write off=0x%03X val=0x%04X (pc=0x%08X)\n", offset,
                                  value & 0xFFFFu, current() != nullptr ? current()->context.pc : 0u);
+                    if (offset == 0x1B0u)
+                    {
+                        // Who got here? The pc ring names the call chain that performed the ADMAS store.
+                        static uint32_t sAdmas = 0u;
+                        if (m_cpu.tracePcCount() != 0u && sAdmas < 12u)
+                        {
+                            ++sAdmas;
+                            char raText[16]; std::snprintf(raText, sizeof(raText), "%08X", current() != nullptr ? current()->context.gpr[31] : 0u); std::string trail = std::string("[spu2] admas caller trail ra=0x") + raText + ":";
+                            const uint32_t count = std::min<uint32_t>(m_cpu.tracePcCount(), 32u);
+                            for (uint32_t back = count; back-- > 0u;)
+                            {
+                                char entry[16];
+                                std::snprintf(entry, sizeof(entry), " %08X", m_cpu.tracePc(back));
+                                trail += entry;
+                            }
+                            m_ee.log(trail);
+                        }
+                    }
                 }
                 else if (offset == 0x1ACu)
                 {
