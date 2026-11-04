@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
@@ -286,10 +287,16 @@ namespace ps2x::iop
         // TOL_TRACE_IOP_RPC=1: which of the three rejections applies - no native server for the sid, the
         // native call itself declining, or no profile route. Without this the caller only sees "unhandled".
         const bool traceRpc = std::getenv("TOL_TRACE_IOP_RPC") != nullptr;
+        // Where does an unanswered call spend its milliseconds? The native-server probe locks the same mutex
+        // the IOP pump thread holds while it settles, so it can block even when nothing answers.
+        const bool traceStage = std::getenv("TOL_TRACE_RPC_STAGE") != nullptr;
+        const auto stageStart = std::chrono::steady_clock::now();
 
         // A server registered by a native module replaces any high-level one.
         uint32_t record = 0, buffer = 0;
-        if (m_impl->native.server(request.sid, record, buffer))
+        const bool nativeServer = m_impl->native.server(request.sid, record, buffer);
+        const auto stageProbed = std::chrono::steady_clock::now();
+        if (nativeServer)
         {
             RpcResult result;
             result.handled = m_impl->native.call(request.sid, request.function, request.send.address,
@@ -346,6 +353,18 @@ namespace ps2x::iop
                 std::fprintf(stderr,
                              "[iop-rpc] sid=0x%08X fn=0x%X -> NO native server and no route (unhandled)\n",
                              request.sid, request.function);
+            }
+            if (traceStage)
+            {
+                static uint32_t sStages = 0u;
+                if (++sStages <= 40u)
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    auto ms = [](auto from, auto to)
+                    { return std::chrono::duration<double, std::milli>(to - from).count(); };
+                    std::fprintf(stderr, "[iopstage] sid=0x%08X fn=0x%X probe=%.3f rest=%.3f\n", request.sid,
+                                 request.function, ms(stageStart, stageProbed), ms(stageProbed, now));
+                }
             }
             return {};
         }
