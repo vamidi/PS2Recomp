@@ -1,6 +1,11 @@
 #include "Common.h"
 #include "FileIO.h"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+
 namespace ps2_syscalls
 {
     static int allocatePs2Fd(FILE *file)
@@ -241,6 +246,56 @@ namespace ps2_syscalls
         setReturnS32(ctx, (int32_t)bytesRead);
     }
 
+    namespace
+    {
+        bool fioWriteTracingEnabled()
+        {
+            static const bool enabled = std::getenv("TOL_TRACE_FIO_WRITE") != nullptr;
+            return enabled;
+        }
+
+        struct FioWriteStats
+        {
+            uint64_t calls = 0u;
+            uint64_t bytes = 0u;
+            double totalMs = 0.0;
+            double maxMs = 0.0;
+            std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+        };
+
+        // Guest console output: one line a second per descriptor, so a printer that writes a byte at a time
+        // shows up as a call count in the thousands with a large total. That is what a "silence the guest's
+        // debug output" fix has to be sized against.
+        void recordFioWrite(int ps2Fd, size_t size, std::chrono::steady_clock::time_point start)
+        {
+            if (!fioWriteTracingEnabled())
+            {
+                return;
+            }
+            static std::map<int, FioWriteStats> table;
+            FioWriteStats &stats = table[ps2Fd];
+            const auto now = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(now - start).count();
+            ++stats.calls;
+            stats.bytes += size;
+            stats.totalMs += ms;
+            if (ms > stats.maxMs)
+            {
+                stats.maxMs = ms;
+            }
+            const double window = std::chrono::duration<double>(now - stats.window).count();
+            if (window >= 1.0)
+            {
+                std::fprintf(stderr,
+                             "[fiowrite] fd=%d %.1f calls/s bytes=%llu total=%.1f ms max=%.2f ms\n", ps2Fd,
+                             static_cast<double>(stats.calls) / window,
+                             static_cast<unsigned long long>(stats.bytes), stats.totalMs, stats.maxMs);
+                stats = FioWriteStats{};
+                stats.window = now;
+            }
+        }
+    }
+
     void fioWrite(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int ps2Fd = (int)getRegU32(ctx, 4);   // $a0
@@ -268,6 +323,7 @@ namespace ps2_syscalls
         }
 
         size_t bytesWritten = 0;
+        const auto writeStart = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lock(g_sys_fd_mutex);
             bytesWritten = ::fwrite(hostBuf, 1, size, fp);
@@ -278,6 +334,7 @@ namespace ps2_syscalls
                 return;
             }
         }
+        recordFioWrite(ps2Fd, size, writeStart);
 
         // returns number of bytes written
         setReturnS32(ctx, (int32_t)bytesWritten);

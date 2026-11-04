@@ -2314,7 +2314,7 @@ void EeScheduler::enterGuest(GuestThread &thread)
         const double ms = std::chrono::duration<double, std::milli>(dispatchEnd - dispatchStart).count();
         // A long turn is pure guest execution; its entry and exit pcs bracket the code that ate the time.
         static uint32_t sLongTurns = 0u;
-        if (ms > 5.0 && sLongTurns < 40u && m_exitedThread.empty())
+        if (ms > 5.0 && sLongTurns < 400u && m_exitedThread.empty())
         {
             ++sLongTurns;
             const R5900Context &live = thread.activeContext();
