@@ -184,7 +184,16 @@ namespace ps2x::iop::lle
     {
         if (physical >= 0x1F900000u && physical < 0x1F900800u)
         {
-            uint32_t value = m_spu2.read(physical & 0x7FFu);
+            const uint32_t spuOffset = physical & 0x7FFu;
+            uint32_t value = m_spu2.read(spuOffset);
+            if (std::getenv("TOL_TRACE_SPU2") != nullptr &&
+                (spuOffset == 0x344u || spuOffset == 0x744u || spuOffset == 0x345u || spuOffset == 0x745u))
+            {
+                static uint32_t sStat = 0u;
+                if (++sStat <= 40u)
+                    std::fprintf(stderr, "[spu2] status read off=0x%03X -> 0x%04X (pc=0x%08X)\n", spuOffset,
+                                 value & 0xFFFFu, current() != nullptr ? current()->context.pc : 0u);
+            }
             if (bytes == 4u)
                 value |= static_cast<uint32_t>(m_spu2.read((physical + 2u) & 0x7FFu)) << 16;
             return value;
@@ -778,7 +787,7 @@ namespace ps2x::iop::lle
             readMemory(resultAddress, reply.data(), request.receiveSize);
             m_ee.writeEe(request.receiveAddress, reply.data(), request.receiveSize);
         }
-        request.done = true;
+        if (request.sid == 0x90000300u)        {            const uint32_t reply = resultAddress != 0u ? m_bus.read32(resultAddress) : 0u;            char text[128];            std::snprintf(text, sizeof(text), "[iop] korg fn=%u reply@0x%08X=0x%08X", request.function, resultAddress, reply);            m_ee.log(text);        }        request.done = true;
         m_active.erase(active);
         thread.context = m_saved[thread.id];
         thread.wait = Wait::Rpc;
