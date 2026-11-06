@@ -200,6 +200,35 @@ namespace ps2x::iop
             return true;
         }
 
+        // KORG (sid 0x90000300): same failure mode as IxAudio above. The module registers a dispatcher and
+        // answers function 0xA, but 0x0 / 0x11 / 0x3C never complete - measured as "RPC to 2415919872 timed
+        // out" while the boot script sits at index 16 of 48. Answer those from the adapter with a zeroed
+        // reply so the load can continue; audio is not produced for them either way.
+        const volatile uint32_t liveKorgSid = sid;
+        if (liveKorgSid == 0x90000300u)
+        {
+            const bool korgHangs = (function == 0x0u || function == 0x11u || function == 0x3Cu);
+            if (korgHangs)
+            {
+                if (std::getenv("TOL_TRACE_IOP_CALL") != nullptr)
+                {
+                    static uint32_t sKorgShortCircuits = 0u;
+                    if (sKorgShortCircuits < 20u)
+                    {
+                        ++sKorgShortCircuits;
+                        m_impl->host.log(LogLevel::Warning,
+                                         "[iop-call] korg short-circuit fn=" + std::to_string(function));
+                    }
+                }
+                if (receiveSize != 0u)
+                {
+                    std::vector<uint8_t> zeroReply(receiveSize, 0u);
+                    m_impl->host.writeGuest(receiveAddress, zeroReply.data(), receiveSize);
+                }
+                return true;
+            }
+        }
+
         std::unique_lock lock(m_impl->mutex);
         if (!m_impl->iop.hasServer(sid))
             return false;
