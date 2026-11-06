@@ -1842,11 +1842,13 @@ namespace ps2recomp
                 continue;
             }
 
-            if (isEntryFunctionName(function.name))
-            {
-                continue;
-            }
-
+            // NOTE: do NOT skip "entry_" functions here. Additional entry points discovered inside another
+            // function are emitted as `entry_<addr>` continuations, and they can be *resumed* at an interior
+            // label just like any other generated body (e.g. entry_001f8158 is the loop body of the GS worker
+            // thread, resumed at 0x1F8168 after its yield). Skipping them left those interior addresses with a
+            // null table slot, so lookupFunction() returned the missing-function stub and the guest spun on the
+            // same pc forever. Entry functions are still excluded from caller/owner discovery above, which is
+            // where that exclusion belongs.
             auto decodedIt = m_decodedFunctions.find(function.start);
             if (decodedIt == m_decodedFunctions.end())
             {

@@ -1,6 +1,8 @@
 #include "iop.h"
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -79,6 +81,27 @@ namespace ps2x::iop::lle
             // The IOP has no vblank of its own. A 60 Hz counter off the IOP clock is the stand-in: IxAudio
             // polls this in a loop, and a constant 0 leaves that loop spinning forever.
             {"vblank", 5, "vblankCount"},
+            // cdvdman. Ordinals are the real export numbers (confirmed against the CDVDMAN module in
+            // IOPRP300.IMG and the CDVDMAN interface docs): #6 sceCdRead, #8 sceCdGetError, #11 sceCdSync,
+            // #13 sceCdDiskReady, #114 _sceCdRE (the read cdvdfsv uses). The rest complete synchronously.
+            {"cdvdman", 4, "cdvdInit"},          {"cdvdman", 5, "cdvdStandby"},
+            {"cdvdman", 6, "cdvdRead"},          {"cdvdman", 7, "cdvdSeek"},
+            {"cdvdman", 8, "cdvdGetError"},      {"cdvdman", 9, "cdvdGetToc"},
+            {"cdvdman", 10, "cdvdSearchFile"},   {"cdvdman", 11, "cdvdSync"},
+            {"cdvdman", 12, "cdvdGetDiskType"},  {"cdvdman", 13, "cdvdDiskReady"},
+            {"cdvdman", 14, "cdvdTrayReq"},      {"cdvdman", 15, "cdvdStop"},
+            {"cdvdman", 16, "cdvdPosToInt"},     {"cdvdman", 17, "cdvdIntToPos"},
+            {"cdvdman", 22, "cdvdReadId"},       {"cdvdman", 24, "cdvdCallback"},
+            {"cdvdman", 28, "cdvdStatus"},       {"cdvdman", 29, "cdvdOk"},
+            {"cdvdman", 37, "cdvdCallback"},     {"cdvdman", 38, "cdvdPause"},
+            {"cdvdman", 39, "cdvdBreak"},        {"cdvdman", 40, "cdvdOk"},
+            {"cdvdman", 44, "cdvdOk"},           {"cdvdman", 45, "cdvdOk"},
+            {"cdvdman", 47, "cdvdOk"},           {"cdvdman", 50, "cdvdSC"},
+            {"cdvdman", 54, "cdvdOk"},           {"cdvdman", 62, "cdvdOk"},
+            {"cdvdman", 63, "cdvdOk"},           {"cdvdman", 64, "cdvdOk"},
+            {"cdvdman", 74, "cdvdOk"},           {"cdvdman", 75, "cdvdMmode"},
+            {"cdvdman", 81, "cdvdOk"},           {"cdvdman", 83, "cdvdReadDvdDualInfo"},
+            {"cdvdman", 84, "cdvdSearchFile"},   {"cdvdman", 114, "cdvdRead"},
         };
 
         struct Named
@@ -86,6 +109,178 @@ namespace ps2x::iop::lle
             const char *name;
             void (Iop::*handler)(CpuContext &);
         };
+
+        // ---------------------------------------------------------------- CDVD device
+        // The title's raw sector layer talks to cdvdman, not to the EE file server: cdvdfsv calls
+        // _sceCdRE/sceCdRead with an LSN and expects the bytes in IOP RAM. The host side of that is simply
+        // the detected disc image (main.cpp fills IoPaths::cdImage from CDVD.000 / *.iso beside the ELF),
+        // so every command completes synchronously and reads are served from the real retail layout.
+        constexpr uint32_t kCdvdSectorSize = 2048u;
+        constexpr uint32_t kCdvdErrorNone = 0u;
+        constexpr uint32_t kCdvdErrorAbort = 0x01u;
+        constexpr uint32_t kCdvdErrorRead = 0x30u;
+        constexpr uint32_t kCdvdTypePs2Dvd = 0x14u;
+        constexpr uint32_t kCdvdTypeUnknown = 0x05u;
+        constexpr uint32_t kCdvdReadyComplete = 2u;
+
+        struct CdvdDevice
+        {
+            uint64_t imageHandle = 0u;
+            uint64_t imageBytes = 0u;
+            uint32_t lastError = kCdvdErrorNone;
+            uint32_t callback = 0u;
+            uint32_t reads = 0u;
+        };
+        CdvdDevice g_cdvd;
+
+        // Opens the image once and revalidates the cached handle, so a host-side reset cannot leave a
+        // stale descriptor behind.
+        bool cdvdOpenImage(IopHost *files, std::string &path)
+        {
+            if (files == nullptr)
+                return false;
+            path = files->hostPath(HostPathKind::CdImage);
+            if (path.empty())
+            {
+                const std::string root = files->hostPath(HostPathKind::CdRoot);
+                if (!root.empty())
+                    path = root + "/CDVD.000";
+            }
+            if (path.empty())
+                return false;
+            if (g_cdvd.imageHandle != 0u && files->hostFileSize(g_cdvd.imageHandle, g_cdvd.imageBytes))
+                return true;
+            g_cdvd.imageHandle = files->openHostFile(path);
+            g_cdvd.imageBytes = 0u;
+            if (g_cdvd.imageHandle == 0u)
+                return false;
+            files->hostFileSize(g_cdvd.imageHandle, g_cdvd.imageBytes);
+            if (std::getenv("TOL_TRACE_CDVD") != nullptr)
+                std::fprintf(stderr, "[cdvd] image '%s' -> %llu bytes\n", path.c_str(),
+                             static_cast<unsigned long long>(g_cdvd.imageBytes));
+            return true;
+        }
+
+        bool cdvdReadImage(IopHost *files, uint64_t offset, void *destination, size_t size, size_t &read)
+        {
+            read = 0u;
+            std::string path;
+            if (!cdvdOpenImage(files, path))
+                return false;
+            return files->readHostFile(g_cdvd.imageHandle, offset, destination, size, read);
+        }
+
+        uint32_t cdvdReadLe32(const uint8_t *bytes)
+        {
+            return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |
+                   (static_cast<uint32_t>(bytes[2]) << 16) | (static_cast<uint32_t>(bytes[3]) << 24);
+        }
+
+        void cdvdWriteLe32(uint8_t *bytes, uint32_t value)
+        {
+            bytes[0] = static_cast<uint8_t>(value);
+            bytes[1] = static_cast<uint8_t>(value >> 8);
+            bytes[2] = static_cast<uint8_t>(value >> 16);
+            bytes[3] = static_cast<uint8_t>(value >> 24);
+        }
+
+        // ISO9660 identifiers are uppercase and carry a ";1" version suffix on files.
+        std::string cdvdIsoName(std::string name)
+        {
+            const size_t version = name.find(';');
+            if (version != std::string::npos)
+                name.erase(version);
+            while (name.size() > 1u && name.back() == '.')
+                name.pop_back();
+            for (char &ch : name)
+                ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            return name;
+        }
+
+        std::vector<std::string> cdvdPathComponents(const std::string &path)
+        {
+            std::string text = path;
+            const size_t colon = text.find(':');
+            if (colon != std::string::npos)
+                text.erase(0, colon + 1u);
+            for (char &ch : text)
+                if (ch == '\\')
+                    ch = '/';
+            std::vector<std::string> parts;
+            size_t begin = 0u;
+            while (begin <= text.size())
+            {
+                const size_t end = text.find('/', begin);
+                const std::string part =
+                    text.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+                if (!part.empty() && part != ".")
+                {
+                    if (part == "..")
+                        return {};
+                    parts.push_back(cdvdIsoName(part));
+                }
+                if (end == std::string::npos)
+                    break;
+                begin = end + 1u;
+            }
+            return parts;
+        }
+
+        struct CdvdIsoEntry
+        {
+            uint32_t lsn = 0u;
+            uint32_t size = 0u;
+            uint8_t flags = 0u;
+            std::string name;
+        };
+
+        bool cdvdIsoFind(IopHost *files, uint32_t directoryLsn, uint32_t directoryBytes,
+                         const std::string &wanted, CdvdIsoEntry &out)
+        {
+            if (directoryBytes == 0u)
+                return false;
+            std::vector<uint8_t> directory(directoryBytes);
+            size_t read = 0u;
+            if (!cdvdReadImage(files, static_cast<uint64_t>(directoryLsn) * kCdvdSectorSize, directory.data(),
+                               directory.size(), read) ||
+                read < directory.size())
+                return false;
+            size_t offset = 0u;
+            while (offset + 33u <= directory.size())
+            {
+                const uint32_t recordBytes = directory[offset];
+                if (recordBytes == 0u)
+                {
+                    // A record never spans a sector; zero means "rest of this sector is padding".
+                    offset = ((offset / kCdvdSectorSize) + 1u) * kCdvdSectorSize;
+                    continue;
+                }
+                if (recordBytes < 33u || recordBytes > directory.size() - offset)
+                    break;
+                const uint8_t *record = directory.data() + offset;
+                const uint8_t nameBytes = record[32];
+                if (nameBytes != 0u && 33u + nameBytes <= recordBytes)
+                {
+                    const uint8_t *name = record + 33u;
+                    const bool self = nameBytes == 1u && (name[0] == 0u || name[0] == 1u);
+                    if (!self)
+                    {
+                        const std::string identifier =
+                            cdvdIsoName(std::string(reinterpret_cast<const char *>(name), nameBytes));
+                        if (identifier == wanted)
+                        {
+                            out.lsn = cdvdReadLe32(record + 2u);
+                            out.size = cdvdReadLe32(record + 10u);
+                            out.flags = record[25];
+                            out.name = identifier;
+                            return true;
+                        }
+                    }
+                }
+                offset += recordBytes;
+            }
+            return false;
+        }
     }
 
     void Iop::installKernel()
@@ -240,6 +435,365 @@ namespace ps2x::iop::lle
         ret(c, static_cast<uint32_t>(-5)); // EIO
     }
 
+    // ---------------------------------------------------------------- cdvdman
+    // The commands are asynchronous on hardware, but the host file layer is not: they complete here and
+    // sceCdSync reports "completed" immediately.
+
+    void Iop::cdvdInit(CpuContext &c)
+    {
+        if (arg(c, 0) != 5u) // SCECdEXIT leaves the last error alone
+            g_cdvd.lastError = kCdvdErrorNone;
+        ret(c, 1u);
+    }
+
+    void Iop::cdvdStandby(CpuContext &c)
+    {
+        g_cdvd.lastError = kCdvdErrorNone;
+        ret(c, 1u);
+    }
+
+    void Iop::cdvdStop(CpuContext &c)
+    {
+        g_cdvd.lastError = kCdvdErrorNone;
+        ret(c, 1u);
+    }
+
+    void Iop::cdvdPause(CpuContext &c)
+    {
+        g_cdvd.lastError = kCdvdErrorNone;
+        ret(c, 1u);
+    }
+
+    void Iop::cdvdSeek(CpuContext &c)
+    {
+        g_cdvd.lastError = kCdvdErrorNone;
+        ret(c, 1u);
+    }
+
+    void Iop::cdvdRead(CpuContext &c)
+    {
+        const uint32_t lsn = arg(c, 0);
+        const uint32_t sectors = arg(c, 1);
+        const uint32_t destination = arg(c, 2);
+        const bool trace = std::getenv("TOL_TRACE_CDVD") != nullptr;
+        if (sectors == 0u)
+        {
+            g_cdvd.lastError = kCdvdErrorNone;
+            ret(c, 1u);
+            return;
+        }
+        const uint64_t bytes64 = static_cast<uint64_t>(sectors) * kCdvdSectorSize;
+        if (bytes64 > Bus::kRamBytes || destination >= Bus::kRamBytes ||
+            bytes64 > Bus::kRamBytes - static_cast<uint64_t>(destination))
+        {
+            g_cdvd.lastError = kCdvdErrorRead;
+            if (trace)
+                std::fprintf(stderr, "[cdvd] read reject=ram-range lsn=%u sectors=%u dest=0x%08X\n", lsn, sectors,
+                             destination);
+            ret(c, 0u);
+            return;
+        }
+
+        const size_t bytes = static_cast<size_t>(bytes64);
+        std::vector<uint8_t> data(bytes, 0u);
+        IopHost *files = m_ee.hostFiles();
+        const uint64_t offset = static_cast<uint64_t>(lsn) * kCdvdSectorSize;
+        bool ok = false;
+        const char *reason = "no-image";
+        if (files != nullptr)
+        {
+            size_t read = 0u;
+            if (cdvdReadImage(files, offset, data.data(), bytes, read))
+            {
+                if (read == bytes)
+                {
+                    ok = true;
+                    reason = "image";
+                }
+                else if (read != 0u)
+                {
+                    // Straddles the end of our dump: the tail stays zero and the command still succeeds,
+                    // because a streaming reader cannot recover from a drive error mid-transfer.
+                    ok = true;
+                    reason = "past-eof";
+                }
+                else if (offset >= g_cdvd.imageBytes)
+                {
+                    ok = true;
+                    reason = "past-eof-zero-filled";
+                }
+                else
+                {
+                    reason = "short-read";
+                }
+            }
+            else
+            {
+                reason = "read-failed";
+            }
+        }
+        if (trace)
+        {
+            static uint32_t sLogs = 0u;
+            if (sLogs < 40u || !ok)
+            {
+                ++sLogs;
+                std::fprintf(stderr, "[cdvd] read lsn=%u sectors=%u dest=0x%08X image=%llu bytes ok=%d reason=%s\n",
+                             lsn, sectors, destination, static_cast<unsigned long long>(g_cdvd.imageBytes),
+                             ok ? 1 : 0, reason);
+            }
+        }
+        if (!ok)
+        {
+            g_cdvd.lastError = kCdvdErrorRead;
+            ret(c, 0u);
+            return;
+        }
+        writeMemory(destination, data.data(), static_cast<uint32_t>(bytes));
+        ++g_cdvd.reads;
+        g_cdvd.lastError = kCdvdErrorNone;
+        ret(c, 1u);
+    }
+
+    void Iop::cdvdGetError(CpuContext &c)
+    {
+        ret(c, g_cdvd.lastError);
+    }
+
+    void Iop::cdvdGetToc(CpuContext &c)
+    {
+        const uint32_t buffer = arg(c, 0);
+        if (buffer != 0u && buffer < Bus::kRamBytes)
+        {
+            const uint32_t bytes = std::min<uint32_t>(1024u, Bus::kRamBytes - buffer);
+            std::vector<uint8_t> toc(bytes, 0u);
+            writeMemory(buffer, toc.data(), bytes);
+        }
+        g_cdvd.lastError = kCdvdErrorNone;
+        ret(c, 1u);
+    }
+
+    void Iop::cdvdSearchFile(CpuContext &c)
+    {
+        const uint32_t fileAddress = arg(c, 0);
+        const uint32_t nameAddress = arg(c, 1);
+        const bool trace = std::getenv("TOL_TRACE_CDVD") != nullptr;
+        IopHost *files = m_ee.hostFiles();
+        std::string imagePath;
+        if (fileAddress == 0u || !cdvdOpenImage(files, imagePath))
+        {
+            ret(c, 0u);
+            return;
+        }
+
+        const std::string guestPath = readString(nameAddress, 256u);
+        const std::vector<std::string> parts = cdvdPathComponents(guestPath);
+        if (parts.empty())
+        {
+            if (trace)
+                std::fprintf(stderr, "[cdvd] search '%s' -> empty path\n", guestPath.c_str());
+            ret(c, 0u);
+            return;
+        }
+
+        uint8_t primary[kCdvdSectorSize];
+        size_t read = 0u;
+        if (!cdvdReadImage(files, 16ull * kCdvdSectorSize, primary, sizeof(primary), read) ||
+            read < sizeof(primary) || primary[0] != 1u || std::memcmp(primary + 1u, "CD001", 5u) != 0)
+        {
+            if (trace)
+                std::fprintf(stderr, "[cdvd] search '%s' -> no ISO9660 primary volume descriptor\n",
+                             guestPath.c_str());
+            ret(c, 0u);
+            return;
+        }
+
+        uint32_t directoryLsn = cdvdReadLe32(primary + 156u + 2u);
+        uint32_t directoryBytes = cdvdReadLe32(primary + 156u + 10u);
+        CdvdIsoEntry entry;
+        for (size_t index = 0u; index < parts.size(); ++index)
+        {
+            if (!cdvdIsoFind(files, directoryLsn, directoryBytes, parts[index], entry))
+            {
+                if (trace)
+                    std::fprintf(stderr, "[cdvd] search '%s' -> missing '%s'\n", guestPath.c_str(),
+                                 parts[index].c_str());
+                ret(c, 0u);
+                return;
+            }
+            if (index + 1u < parts.size())
+            {
+                if ((entry.flags & 0x02u) == 0u)
+                {
+                    ret(c, 0u);
+                    return;
+                }
+                directoryLsn = entry.lsn;
+                directoryBytes = entry.size;
+            }
+        }
+
+        // sceCdlFILE: lsn, size, name[16], date/flags[8].
+        uint8_t result[32] = {};
+        cdvdWriteLe32(result + 0u, entry.lsn);
+        cdvdWriteLe32(result + 4u, entry.size);
+        std::memcpy(result + 8u, entry.name.data(), std::min<size_t>(16u, entry.name.size()));
+        result[24] = (entry.flags & 0x02u) ? 2u : 0u;
+        writeMemory(fileAddress, result, sizeof(result));
+        g_cdvd.lastError = kCdvdErrorNone;
+        if (trace)
+            std::fprintf(stderr, "[cdvd] search '%s' -> lsn=%u size=%u\n", guestPath.c_str(), entry.lsn,
+                         entry.size);
+        ret(c, 1u);
+    }
+
+    void Iop::cdvdSync(CpuContext &c)
+    {
+        (void)c;
+        ret(c, 0u); // completed
+    }
+
+    void Iop::cdvdGetDiskType(CpuContext &c)
+    {
+        IopHost *files = m_ee.hostFiles();
+        std::string imagePath;
+        ret(c, cdvdOpenImage(files, imagePath) ? kCdvdTypePs2Dvd : kCdvdTypeUnknown);
+    }
+
+    void Iop::cdvdDiskReady(CpuContext &c)
+    {
+        (void)c;
+        ret(c, kCdvdReadyComplete);
+    }
+
+    void Iop::cdvdTrayReq(CpuContext &c)
+    {
+        if (arg(c, 1) != 0u)
+            m_bus.write32(arg(c, 1), 0u);
+        ret(c, 1u);
+    }
+
+    void Iop::cdvdStatus(CpuContext &c)
+    {
+        (void)c;
+        ret(c, 0x02u); // spinning / ready
+    }
+
+    void Iop::cdvdCallback(CpuContext &c)
+    {
+        const uint32_t previous = g_cdvd.callback;
+        g_cdvd.callback = arg(c, 0);
+        ret(c, previous);
+    }
+
+    void Iop::cdvdBreak(CpuContext &c)
+    {
+        (void)c;
+        g_cdvd.lastError = kCdvdErrorAbort;
+        ret(c, 1u);
+    }
+
+    void Iop::cdvdSC(CpuContext &c)
+    {
+        // Internal control channel used by cdvdfsv. The values mirror the HLE cdvd implementation:
+        // timeouts, the drive's event-flag id, the module version, and the last error code.
+        const int32_t code = static_cast<int32_t>(arg(c, 0));
+        const uint32_t param = arg(c, 1);
+        switch (code)
+        {
+        case -23: // translate a logical sector
+            ret(c, param != 0u ? m_bus.read32(param) : 0u);
+            return;
+        case -18: // set the read timeout
+            ret(c, 0u);
+            return;
+        case -17: // get the streaming timeout
+            ret(c, 0x1000u);
+            return;
+        case -15: // get the sync timeout
+            ret(c, 0x1000u);
+            return;
+        case -11: // interrupt event-flag id (0: none)
+            ret(c, 0u);
+            return;
+        case -9: // module version (PsIIcdvdman 300a)
+            ret(c, 0x300Au);
+            return;
+        case -2: // push an error into the driver
+            if (param != 0u)
+                g_cdvd.lastError = m_bus.read8(param);
+            ret(c, g_cdvd.lastError);
+            return;
+        case -1:
+        case 0:
+        case 1:
+        case 2:
+            if (param != 0u)
+                m_bus.write32(param, g_cdvd.lastError & 0xFFu);
+            ret(c, 0u);
+            return;
+        default:
+            ret(c, 0u);
+            return;
+        }
+    }
+
+    void Iop::cdvdMmode(CpuContext &c)
+    {
+        (void)c;
+        ret(c, 1u);
+    }
+
+    void Iop::cdvdReadDvdDualInfo(CpuContext &c)
+    {
+        if (arg(c, 0) != 0u)
+            m_bus.write32(arg(c, 0), 0u);
+        if (arg(c, 1) != 0u)
+            m_bus.write32(arg(c, 1), 0u);
+        ret(c, 1u);
+    }
+
+    void Iop::cdvdPosToInt(CpuContext &c)
+    {
+        const uint32_t address = arg(c, 0);
+        const auto bcd = [](uint8_t value) -> uint32_t
+        { return (value >> 4) * 10u + (value & 0x0Fu); };
+        const uint32_t minute = bcd(m_bus.read8(address + 0u));
+        const uint32_t second = bcd(m_bus.read8(address + 1u));
+        const uint32_t sector = bcd(m_bus.read8(address + 2u));
+        const uint32_t lsn = (minute * 60u + second) * 75u + sector;
+        ret(c, lsn >= 150u ? lsn - 150u : 0u);
+    }
+
+    void Iop::cdvdIntToPos(CpuContext &c)
+    {
+        const uint32_t address = arg(c, 1);
+        const auto bcd = [](uint32_t value) -> uint8_t
+        { return static_cast<uint8_t>(((value / 10u) << 4) | (value % 10u)); };
+        const uint32_t lsn = arg(c, 0) + 150u;
+        m_bus.write8(address + 0u, bcd((lsn / 75u) / 60u));
+        m_bus.write8(address + 1u, bcd((lsn / 75u) % 60u));
+        m_bus.write8(address + 2u, bcd(lsn % 75u));
+        m_bus.write8(address + 3u, 0u);
+        ret(c, address);
+    }
+
+    void Iop::cdvdReadId(CpuContext &c)
+    {
+        const uint32_t buffer = arg(c, 0);
+        for (uint32_t index = 0u; index < 8u; ++index)
+            m_bus.write8(buffer + index, 0u);
+        if (arg(c, 1) != 0u)
+            m_bus.write32(arg(c, 1), 0u);
+        ret(c, 1u);
+    }
+
+    void Iop::cdvdOk(CpuContext &c)
+    {
+        (void)c;
+        ret(c, 1u);
+    }
+
     void Iop::vblankCount(CpuContext &c)
     {
         // 60 Hz off the IOP clock (36.864 MHz). Modules that wait for the count to change now progress.
@@ -295,8 +849,73 @@ namespace ps2x::iop::lle
 
     void Iop::kprintf(CpuContext &c)
     {
-        // Only the format string; enough to follow what the drivers report.
-        std::string text = readString(arg(c, 0));
+        // Modules log through this; formatting the common conversions makes their diagnostics readable
+        // (the driver messages that matter name a device or an error code).
+        const std::string format = readString(arg(c, 0));
+        std::string text;
+        unsigned argument = 1u;
+        for (size_t index = 0u; index < format.size(); ++index)
+        {
+            if (format[index] != '%' || index + 1u >= format.size())
+            {
+                text.push_back(format[index]);
+                continue;
+            }
+            size_t next = index + 1u;
+            if (format[next] == '%')
+            {
+                text.push_back('%');
+                index = next;
+                continue;
+            }
+            bool zeroPad = false;
+            bool leftPad = false;
+            while (next < format.size() && (format[next] == '0' || format[next] == '-'))
+            {
+                zeroPad = zeroPad || format[next] == '0';
+                leftPad = leftPad || format[next] == '-';
+                ++next;
+            }
+            unsigned width = 0u;
+            while (next < format.size() && format[next] >= '0' && format[next] <= '9')
+            {
+                width = width * 10u + static_cast<unsigned>(format[next] - '0');
+                ++next;
+            }
+            while (next < format.size() && (format[next] == 'l' || format[next] == 'h'))
+                ++next;
+            if (next >= format.size())
+                break;
+            const char conversion = format[next];
+            const uint32_t value = arg(c, argument++);
+            char buffer[32];
+            if (conversion == 's')
+            {
+                text += readString(value, 256u);
+            }
+            else if (conversion == 'c')
+            {
+                text.push_back(static_cast<char>(value & 0xFFu));
+            }
+            else if (conversion == 'x' || conversion == 'X' || conversion == 'p')
+            {
+                std::snprintf(buffer, sizeof(buffer), zeroPad ? "%0*x" : "%*x", static_cast<int>(width), value);
+                text += buffer;
+            }
+            else if (conversion == 'd' || conversion == 'i' || conversion == 'u')
+            {
+                const long long signedValue = static_cast<int32_t>(value);
+                std::snprintf(buffer, sizeof(buffer), zeroPad ? "%0*lld" : "%*lld",
+                              static_cast<int>(width), conversion == 'u' ? static_cast<long long>(value) : signedValue);
+                text += buffer;
+            }
+            else
+            {
+                text.push_back('%');
+                text.push_back(conversion);
+            }
+            index = next;
+        }
         while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
             text.pop_back();
         if (!text.empty())
@@ -315,12 +934,22 @@ namespace ps2x::iop::lle
                 break;
             name.push_back(static_cast<char>(ch));
         }
+        // The export table's first slots are reserved and hold zero; the real function list follows and is
+        // terminated by a zero. Stopping at the first zero (as an import table would) registers no functions
+        // at all, which silently disabled every module's exports.
         std::vector<uint32_t> functions;
-        for (uint32_t entry = table + 20u; entry < table + 20u + 1024u; entry += 4u)
+        bool sawFunction = false;
+        for (uint32_t entry = table + 20u; entry < table + 20u + 4096u; entry += 4u)
         {
             const uint32_t address = m_bus.read32(entry);
             if (address == 0u)
-                break;
+            {
+                if (sawFunction)
+                    break;
+                functions.push_back(0u); // reserved ordinal
+                continue;
+            }
+            sawFunction = true;
             functions.push_back(address);
         }
         m_exports[name] = std::move(functions);

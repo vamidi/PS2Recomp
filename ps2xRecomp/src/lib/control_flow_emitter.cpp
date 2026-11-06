@@ -234,6 +234,14 @@ namespace ps2recomp
                                   isCall ? "JAL" : "J",
                                   indent,
                                   true);
+        // A jump never falls through. The dispatch runs the target to completion and leaves the
+        // continuation in ctx->pc (shared-epilogue switch cases leave the epilogue PC, and a tail
+        // jump leaves the callee's return address). Falling through would overwrite ctx->pc with
+        // the source function's next instruction - e.g. a `jr v0` switch jump restarting case 0.
+        if (!isCall)
+        {
+            m_ss << indent << "return;\n";
+        }
     }
 
     void ControlFlowEmitter::emitExternalRegisterCallDispatch(std::string_view jumpTargetExpression, std::string_view indent)
@@ -275,6 +283,9 @@ namespace ps2recomp
                                   "JR",
                                   indent,
                                   true);
+        // See emitExternalJumpDispatch: a jump does not fall through, and ctx->pc already holds the
+        // continuation the target body left behind.
+        m_ss << indent << "return;\n";
     }
 
     bool ControlFlowEmitter::emitRelocationCallIfAvailable(StaticBranchKind kind, std::string_view indent)

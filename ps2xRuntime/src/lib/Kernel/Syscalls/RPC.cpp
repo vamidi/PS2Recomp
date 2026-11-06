@@ -635,6 +635,18 @@ namespace ps2_syscalls
                 }
             }
 
+            // TOL_TRACE_VIFSTATUS=1: the worker's VIF1 ready-query RPC (sid
+            // 0x80000593) writes its 4-byte status here. Dump it so a stuck
+            // "busy forever" status is visible instead of guessed.
+            if (sid == 0x80000593u && rpcNum == 0xCu && receiveBuffer != 0u && receiveSize >= 4u &&
+                std::getenv("TOL_TRACE_VIFSTATUS") != nullptr)
+            {
+                uint32_t status = 0u;
+                std::memcpy(&status, rdram + (receiveBuffer & 0x1FFFFFFFu), sizeof(status));
+                std::fprintf(stderr, "[vifstatus] fn=0x%X recv=0x%08X -> 0x%08X handled=%d\n",
+                             rpcNum, receiveBuffer, status, handled ? 1 : 0);
+            }
+
             auto completeClient = [=](R5900Context &base, bool callbackCompleted)
             {
                 {
@@ -714,7 +726,12 @@ namespace ps2_syscalls
             {
                 completeClient(base, true);
             };
-            runtime->eeScheduler().invokeCurrent(std::move(callback));
+            // An async SIF RPC must not run its end function on the caller's turn: the caller is supposed to
+            // block (usually in WaitSema) until the callback runs. Invoking it inline made the caller's next
+            // WaitSema find the semaphore already signalled, turning the sound driver's completion-driven
+            // loop into a busy spin that starved the sound thread. Queue it so the scheduler runs it once the
+            // caller has actually yielded.
+            runtime->eeScheduler().queueInvocation(std::move(callback));
         };
 
         if (serverDispatched)

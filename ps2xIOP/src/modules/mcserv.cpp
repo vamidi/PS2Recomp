@@ -18,8 +18,12 @@ namespace ps2x::iop::detail
         constexpr uint32_t kMcservDev9Sid = 0x80000480u;
         constexpr int32_t kSucceeded = 0;
         constexpr int32_t kDenied = -5;
-        constexpr uint32_t kMcservVersion = 0x0205u;
-        constexpr uint32_t kMcmanVersion = 0x0206u;
+        // The game's libmc (FUN_001257f8) requires mcserv >= 0x20a and mcman
+        // >= 0x20e (`slti v0, mcman, 0x20e; beq v0, zero, success`). The old
+        // 0x0205/0x0206 pair made libmc abort with "too old release of
+        // mcserv.irx" and skip the memory-card path entirely.
+        constexpr uint32_t kMcservVersion = 0x020Au;
+        constexpr uint32_t kMcmanVersion = 0x020Eu;
         constexpr uint32_t kCreateDirectory = 0x0040u;
 
         enum class Operation

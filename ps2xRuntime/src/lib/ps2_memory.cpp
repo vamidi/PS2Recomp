@@ -1276,6 +1276,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         return true;
     }
 
+    {
+        static const bool sTraceIpu = std::getenv("TOL_TRACE_IPU") != nullptr;
+        if (sTraceIpu && address >= 0x10002000u && address <= 0x1000701Fu)
+        {
+            static uint32_t sIpuWLogs = 0u;
+            if (sIpuWLogs < 300u)
+                std::fprintf(stderr, "[ipu] w 0x%08X = 0x%08X\n", address, value);
+            ++sIpuWLogs;
+        }
+    }
+
     if (address >= 0x10002000 && address <= 0x10002030)
     {
         if (address == 0x10002010)
@@ -2326,6 +2337,17 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
             return static_cast<uint32_t>((*reg >> (off * 8u)) & 0xFFFFFFFFull);
         }
         return 0u;
+    }
+
+    {
+        static const bool sTraceIpu = std::getenv("TOL_TRACE_IPU") != nullptr;
+        if (sTraceIpu && address >= 0x10002000u && address <= 0x1000701Fu)
+        {
+            static uint32_t sIpuRLogs = 0u;
+            if (sIpuRLogs < 300u)
+                std::fprintf(stderr, "[ipu] r 0x%08X\n", address);
+            ++sIpuRLogs;
+        }
     }
 
     if (address >= 0x10002000 && address <= 0x10002030)

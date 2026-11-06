@@ -390,6 +390,26 @@ int PS2IopTransport::bootIopImage(PS2Runtime *runtime, const std::vector<uint8_t
             if (type == 1u)
                 end = std::max(end, static_cast<size_t>(fileOffset) + fileSize);
         }
+        // The relocation tables live in SHT_REL sections *after* the load segment. Slicing at the end of
+        // PT_LOAD drops them, and parseIrx then sees no relocations: the module runs unrelocated, every
+        // absolute address points into itself at offset 0, and its init thread dies. Keep the sections too.
+        const uint32_t shoff = *reinterpret_cast<const uint32_t *>(image.data() + offset + 0x20);
+        const uint16_t shentsize = *reinterpret_cast<const uint16_t *>(image.data() + offset + 0x2E);
+        const uint16_t shnum = *reinterpret_cast<const uint16_t *>(image.data() + offset + 0x30);
+        if (shoff != 0u && shentsize >= 40u && shnum != 0u)
+        {
+            end = std::max(end, static_cast<size_t>(shoff) + static_cast<size_t>(shentsize) * shnum);
+            for (uint16_t index = 0; index < shnum; ++index)
+            {
+                const size_t entry = offset + shoff + static_cast<size_t>(index) * shentsize;
+                if (entry + 40u > image.size())
+                    break;
+                const uint32_t sectionOffset = *reinterpret_cast<const uint32_t *>(image.data() + entry + 16u);
+                const uint32_t sectionSize = *reinterpret_cast<const uint32_t *>(image.data() + entry + 20u);
+                if (sectionSize != 0u)
+                    end = std::max(end, static_cast<size_t>(sectionOffset) + sectionSize);
+            }
+        }
         if (end != 0u && offset + end <= image.size())
         {
             modules.emplace_back(offset, end);

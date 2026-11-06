@@ -162,6 +162,12 @@ namespace ps2x::iop::lle
         if (cursor + size > Bus::kRamBytes)
             return 0;
         m_allocations[cursor] = size;
+        if (std::getenv("TOL_TRACE_IOP_PC") != nullptr)
+        {
+            char text[96];
+            std::snprintf(text, sizeof(text), "[iop] alloc 0x%08X size=0x%X", cursor, size);
+            m_ee.log(text);
+        }
         return cursor;
     }
 
@@ -592,6 +598,33 @@ namespace ps2x::iop::lle
                         finishRequest(*thread, server != m_servers.end() ? server->second.buffer : 0u);
                         break;
                     }
+                    if (std::getenv("TOL_TRACE_IOP_PC") != nullptr)
+                    {
+                        // A thread that dies outside an RPC handler still needs its trail; the IOP's
+                        // module init threads hit this path while they are being loaded.
+                        char raText[16];
+                        char spText[16];
+                        char trapWord[16];
+                        std::snprintf(raText, sizeof(raText), "%08X", thread->context.gpr[31]);
+                        std::snprintf(spText, sizeof(spText), "%08X", thread->context.gpr[29]);
+                        std::snprintf(trapWord, sizeof(trapWord), "%08X", m_bus.read32(m_returnTrap));
+                        m_ee.log(std::string("[iop] fault tid=") + std::to_string(thread->id) + " ra=0x" + raText +
+                                 " sp=0x" + spText + " returnTrap=0x" + [&] {
+                                     char text[16];
+                                     std::snprintf(text, sizeof(text), "%08X", m_returnTrap);
+                                     return std::string(text);
+                                 }() +
+                                 " trapWord=0x" + trapWord);
+                        std::string trail = "[iop] pc trail:";
+                        const uint32_t count = std::min<uint32_t>(m_cpu.tracePcCount(), 32u);
+                        for (uint32_t back = count; back-- > 0u;)
+                        {
+                            char entry[16];
+                            std::snprintf(entry, sizeof(entry), " %08X", m_cpu.tracePc(back));
+                            trail += entry;
+                        }
+                        m_ee.log(trail);
+                    }
                     thread->dormant = true;
                     reschedule();
                     break;
@@ -866,8 +899,14 @@ namespace ps2x::iop::lle
         for (const IrxImport &import : imports)
         {
             uint32_t word = 0;
+            // cdvdman and ioman are provided by the kernel, not by the modules in the boot image:
+            //  * cdvdman's real implementation drives the Mechacon registers, which this LLE does not emulate;
+            //    the kernel reads the host image instead.
+            //  * ioman's kernel handlers map cdrom0:/host: paths onto the extracted disc tree, which is what the
+            //    IOP modules (and the real CDVDMAN init, which opens devices through ioman) need here.
+            const bool kernelProvided = import.library == "cdvdman" || import.library == "ioman";
             const auto exported = m_exports.find(import.library);
-            if (exported != m_exports.end() && import.ordinal < exported->second.size() &&
+            if (!kernelProvided && exported != m_exports.end() && import.ordinal < exported->second.size() &&
                 exported->second[import.ordinal] != 0u)
                 word = 0x08000000u | ((exported->second[import.ordinal] >> 2) & 0x03FFFFFFu); // j target
             else
@@ -879,6 +918,43 @@ namespace ps2x::iop::lle
     int32_t Iop::loadModule(const std::vector<uint8_t> &file, const std::string &path,
                             const std::vector<std::string> &arguments)
     {
+        // TOL_CDVD_SELFTEST=1: exercise the same handlers cdvdman exposes, against the detected image.
+        // This runs on the first module load, after the runtime has resolved the IO paths.
+        static bool sCdvdSelfTested = false;
+        if (!sCdvdSelfTested && std::getenv("TOL_CDVD_SELFTEST") != nullptr)
+        {
+            sCdvdSelfTested = true;
+            const uint32_t sector = allocate(2048u);
+            CpuContext context;
+            context.gpr[4] = 16u; // primary volume descriptor
+            context.gpr[5] = 1u;
+            context.gpr[6] = sector;
+            cdvdRead(context);
+            char pvd[32];
+            std::snprintf(pvd, sizeof(pvd), "%02X%02X%02X%02X%02X%02X", m_bus.read8(sector),
+                          m_bus.read8(sector + 1u), m_bus.read8(sector + 2u), m_bus.read8(sector + 3u),
+                          m_bus.read8(sector + 4u), m_bus.read8(sector + 5u));
+            m_ee.log("[cdvd] selftest read lsn=16 sectors=1 -> ret=" + std::to_string(context.gpr[2]) +
+                     " pvd=" + pvd);
+
+            const char guestName[] = "\\SYSTEM.CNF;1";
+            const uint32_t name = allocate(sizeof(guestName));
+            for (size_t index = 0u; index < sizeof(guestName); ++index)
+                m_bus.write8(name + static_cast<uint32_t>(index), static_cast<uint8_t>(guestName[index]));
+            const uint32_t file = allocate(32u);
+            context = CpuContext{};
+            context.gpr[4] = file;
+            context.gpr[5] = name;
+            cdvdSearchFile(context);
+            m_ee.log("[cdvd] selftest search " + std::string(guestName) +
+                     " -> ret=" + std::to_string(context.gpr[2]) +
+                     " lsn=" + std::to_string(m_bus.read32(file)) +
+                     " size=" + std::to_string(m_bus.read32(file + 4u)));
+            release(name);
+            release(file);
+            release(sector);
+        }
+
         IrxImage irx;
         std::string error;
         if (!parseIrx(file, irx, error))
@@ -928,6 +1004,22 @@ namespace ps2x::iop::lle
         loader.context.gpr[29] = loader.stackBase + loader.stackSize - 16u;
         loader.context.gpr[31] = m_returnTrap;
         loader.readySequence = ++m_readySequence;
+        if (std::getenv("TOL_TRACE_IOP_PC") != nullptr)
+        {
+            char text[160];
+            std::snprintf(text, sizeof(text),
+                          "[iop] load %s base=0x%08X size=0x%X entry=0x%08X stack=0x%08X sp=0x%08X",
+                          irx.name.c_str(), base, size, base + irx.entry, loader.stackBase, loader.context.gpr[29]);
+            m_ee.log(text);
+            std::string words = "[iop]   words:";
+            for (uint32_t index = 0u; index < 8u; ++index)
+            {
+                char word[16];
+                std::snprintf(word, sizeof(word), " %08X", m_bus.read32(base + index * 4u));
+                words += word;
+            }
+            m_ee.log(words);
+        }
         const int32_t loaderId = loader.id;
         m_threads[loaderId] = loader;
         m_loaderResult = 0xFFFFFFFFu;

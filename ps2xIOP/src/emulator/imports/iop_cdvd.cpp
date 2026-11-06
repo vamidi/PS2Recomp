@@ -283,7 +283,13 @@ namespace ps2x::iop::detail
                 return true;
 
             case 28: // sceCdStatus
-                cpu.gpr[2] = kCdvdStatusPause;
+                // Reads are synchronous in this module and the host image is
+                // always present, so the drive is always ready. Returning
+                // kCdvdStatusPause (0x0A) here made cdvdman keep reporting
+                // "reading" (2), so libcdvd's sceCdSync wait in the game's
+                // loading worker never saw completion and the first frame
+                // stalled on NOW LOADING.
+                cpu.gpr[2] = 1u; // SCECdReady
                 return true;
 
             case 37: // sceCdCallback
@@ -370,6 +376,11 @@ namespace ps2x::iop::detail
 
         void signalCommandComplete()
         {
+            // Create the interrupt event flag on demand. The previous code only
+            // signalled when the flag already existed; if cdvdman requested it
+            // lazily (sceCdSC -11) the completion was lost and sceCdSync kept
+            // reporting "reading" (2) forever, stalling the loading worker.
+            (void)ensureInterruptEventFlag();
             if (interruptEventFlagId != 0)
                 (void)kernel.setInternalEventFlag(interruptEventFlagId, kCdvdInterruptReadyBits);
         }

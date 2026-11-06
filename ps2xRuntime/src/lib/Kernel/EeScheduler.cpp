@@ -395,6 +395,23 @@ void EeScheduler::run()
             break;
         }
 
+        // TOL_TRACE_INVQ=1: an interrupt is queued as a GuestInvocation, and the queue is only consulted
+        // inside the m_currentThreadId == 0 branch below. If a guest thread stays inGuestCall, invocations
+        // accumulate and never run. This prints the queue depth whenever it changes.
+        if (std::getenv("TOL_TRACE_INVQ") != nullptr)
+        {
+            static uint64_t sInvqLog = 0u;
+            static size_t sInvqLast = size_t(-1);
+            GuestThread *invqCurrent = m_currentThreadId != 0 ? currentThread() : nullptr;
+            const bool invqInCall = invqCurrent != nullptr && invqCurrent->inGuestCall;
+            if (m_pendingInvocations.size() != sInvqLast || (++sInvqLog % 4000u) == 0u)
+            {
+                sInvqLast = m_pendingInvocations.size();
+                std::fprintf(stderr, "[invq] cur=%d inGuestCall=%d q=%zu\n", m_currentThreadId,
+                             invqInCall ? 1 : 0, m_pendingInvocations.size());
+            }
+        }
+
         if (m_currentThreadId == 0)
         {
             GuestThread *next = selectReady();
