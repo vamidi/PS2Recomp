@@ -1629,6 +1629,41 @@ int EeScheduler::cancelAlarm(int id)
 void EeScheduler::queueInvocation(GuestInvocation invocation)
 {
     assertExecutor();
+    if (std::getenv("TOL_TRACE_INVOC") != nullptr)
+    {
+        static uint64_t sTotal = 0u;
+        static std::map<uint32_t, uint64_t> sByPc;
+        static std::map<uint32_t, uint64_t> sByKind;
+        ++sTotal;
+        ++sByPc[invocation.context.pc];
+        ++sByKind[static_cast<uint32_t>(invocation.kind)];
+        if ((sTotal % 500u) == 0u)
+        {
+            std::fprintf(stderr, "[invoc] total=%llu pending=%zu", static_cast<unsigned long long>(sTotal),
+                         m_pendingInvocations.size());
+            for (const auto &[kind, count] : sByKind)
+                std::fprintf(stderr, " kind%u=%llu", kind, static_cast<unsigned long long>(count));
+            std::fprintf(stderr, " top:");
+            for (int i = 0; i < 6; ++i)
+            {
+                uint32_t bestPc = 0u;
+                uint64_t bestCount = 0u;
+                for (const auto &[pc, count] : sByPc)
+                {
+                    if (count > bestCount)
+                    {
+                        bestCount = count;
+                        bestPc = pc;
+                    }
+                }
+                if (bestCount == 0u)
+                    break;
+                std::fprintf(stderr, " 0x%08X=%llu", bestPc, static_cast<unsigned long long>(bestCount));
+                sByPc[bestPc] = 0u;
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
     invocation.sequence = ++m_invocationSequence;
     m_pendingInvocations.push_back(std::move(invocation));
     m_checkpointPending.store(true, std::memory_order_release);
@@ -1824,6 +1859,23 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
 void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
 {
     assertExecutor();
+    if (std::getenv("TOL_TRACE_EE_IRQ") != nullptr)
+    {
+        static uint64_t sTotal = 0u;
+        static uint64_t sByCause[32] = {};
+        ++sTotal;
+        if (cause < 32u)
+            ++sByCause[cause];
+        if ((sTotal % 200u) == 0u)
+        {
+            std::fprintf(stderr, "[eeirq] total=%llu lastDmac=%d last=%u", static_cast<unsigned long long>(sTotal),
+                         dmac ? 1 : 0, cause);
+            for (uint32_t i = 0u; i < 32u; ++i)
+                if (sByCause[i] != 0u)
+                    std::fprintf(stderr, " c%u=%llu", i, static_cast<unsigned long long>(sByCause[i]));
+            std::fprintf(stderr, "\n");
+        }
+    }
     // Device completion remains pending while its handler or mask is disabled.
     uint32_t &pending = dmac ? m_pendingDmacMask : m_pendingIntcMask;
     const uint32_t causeBit = cause < 32u ? (1u << cause) : 0u;
