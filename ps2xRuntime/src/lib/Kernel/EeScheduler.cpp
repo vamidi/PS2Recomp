@@ -1008,6 +1008,14 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
     assertExecutor();
     GuestThread *exiting = currentThread();
     assert(exiting != nullptr);
+    // TOL_TRACE_BOOT=1: the main thread ends up Dormant at pc=0x41, which means the guest asked to exit
+    // rather than the loop returning (FUN_00153180 always returns 0). This names the moment and the site.
+    if (std::getenv("TOL_TRACE_BOOT") != nullptr)
+    {
+        std::fprintf(stderr, "[boot] exitCurrent id=%d delete=%d pc=0x%08X ra=0x%08X sp=0x%08X\n", exiting->id,
+                     deleteThreadRecord ? 1 : 0, exiting->activeContext().pc,
+                     getRegU32(&exiting->activeContext(), 31), getRegU32(&exiting->activeContext(), 29));
+    }
     const int id = exiting->id;
     const uint32_t ownedStack = deleteThreadRecord && exiting->ownsStack ? exiting->stack : 0u;
     makeDormant(*exiting);
