@@ -977,6 +977,13 @@ namespace ps2x::iop::lle
         line.handler = arg(c, 2);
         line.argument = arg(c, 3);
         line.gp = c.gpr[28];
+        if (std::getenv("TOL_TRACE_INTR") != nullptr)
+        {
+            static uint32_t sRegistered = 0u;
+            if (++sRegistered <= 40u)
+                std::fprintf(stderr, "[intr] register line=%u mode=%u handler=0x%08X arg=0x%08X\n", arg(c, 0),
+                             arg(c, 1), arg(c, 2), arg(c, 3));
+        }
         ret(c, 0);
     }
 

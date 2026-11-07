@@ -382,15 +382,33 @@ namespace ps2x::iop::lle
     {
         if (m_intrSuspend > 0)
             return;
+        static const bool traceIntr = std::getenv("TOL_TRACE_INTR") != nullptr;
+        static uint32_t sTraced = 0u;
         while (!m_pendingInterrupts.empty())
         {
             const uint32_t line = m_pendingInterrupts.front();
             m_pendingInterrupts.erase(m_pendingInterrupts.begin());
             const auto found = m_interrupts.find(line);
-            if (found == m_interrupts.end() || !found->second.enabled || found->second.handler == 0u)
+            const bool deliverable =
+                found != m_interrupts.end() && found->second.enabled && found->second.handler != 0u;
+            if (traceIntr && sTraced < 80u)
+            {
+                ++sTraced;
+                std::fprintf(stderr, "[intr] raise line=%u deliverable=%d registered=%d enabled=%d handler=0x%08X\n",
+                             line, deliverable ? 1 : 0, found != m_interrupts.end() ? 1 : 0,
+                             (found != m_interrupts.end() && found->second.enabled) ? 1 : 0,
+                             found != m_interrupts.end() ? found->second.handler : 0u);
+            }
+            if (!deliverable)
                 continue;
             uint32_t result = 0;
             call(found->second.handler, {found->second.argument}, &result, found->second.gp);
+            if (traceIntr && sTraced < 80u)
+            {
+                ++sTraced;
+                std::fprintf(stderr, "[intr] handler line=%u returned %u%s\n", line, result,
+                             result == 0u ? "  -> LINE DISABLED" : "");
+            }
             // A handler returning zero leaves its line disabled.
             if (result == 0u)
                 found->second.enabled = false;
