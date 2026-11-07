@@ -575,6 +575,29 @@ void GS::latchHostPresentationFrame()
     if (rowPitchBytes == 0u && width <= std::numeric_limits<uint32_t>::max() / 4u)
         rowPitchBytes = width * 4u;
     const bool usedPreferred = frame.usedPreferred;
+
+    // TOL_TRACE_GSPRESENT: the presentation decision, once every 30 frames. "presented=0" means the
+    // backend declined (PMODE CRT1/CRT2 off or DISPLAY1 unset), which is a different defect from
+    // "presented a black buffer". The raw DISPFB1/DISPLAY1 and the two context framebuffers make it
+    // possible to tell the display's chosen FBP apart from the FBP the draws target.
+    if (std::getenv("TOL_TRACE_GSPRESENT") != nullptr)
+    {
+        static uint32_t sPresentLogCounter = 0u;
+        if ((sPresentLogCounter++ % 30u) == 0u)
+        {
+            std::fprintf(stderr,
+                         "[gspresent] n=%u presented=%d mode=%d displayFbp=%u sourceFbp=%u %ux%u preferred=%d"
+                         " pmode=0x%08X smode2=0x%08X dispfb1=0x%08X display1=0x%08X dispfb2=0x%08X display2=0x%08X"
+                         " ctxFbp=[%u,%u] ctxFrame2=0x%08X\n",
+                         sPresentLogCounter - 1u, presented ? 1 : 0, static_cast<int>(frame.mode), displayFbp,
+                         sourceFbp, width, height, usedPreferred ? 1 : 0, request.pmode, request.smode2,
+                         request.dispfb1, request.display1, request.dispfb2, request.display2,
+                         request.contextFrames[0].fbp, request.contextFrames[1].fbp,
+                         static_cast<unsigned>(request.contextFrames[1].fbp) |
+                             (static_cast<unsigned>(request.contextFrames[1].fbw) << 16));
+        }
+    }
+
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
         if (hasHostFrame)
@@ -1223,6 +1246,17 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
 
 void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
+    // TOL_TRACE_GSREG: the display/framebuffer setup registers, which decide what is shown versus
+    // what is drawn into. GS_REG_FRAME_1/2 (0x1C/0x1D), DISPFB1/2 (0x59/0x5B), DISPLAY1/2 (0x5A/0x5C)
+    // and PMODE/SMODE2. These are written rarely, so logging all of them is cheap.
+    if (std::getenv("TOL_TRACE_GSREG") != nullptr &&
+        (regAddr == GS_REG_FRAME_1 || regAddr == GS_REG_FRAME_2 || regAddr == 0x59u || regAddr == 0x5Au ||
+         regAddr == 0x5Bu || regAddr == 0x5Cu || regAddr == 0x00u || regAddr == 0x01u))
+    {
+        std::fprintf(stderr, "[gsreg] reg=0x%02X value=0x%016llX\n", static_cast<unsigned>(regAddr),
+                     static_cast<unsigned long long>(value));
+    }
+
     const bool interestingReg =
         regAddr == GS_REG_PRIM ||
         regAddr == GS_REG_RGBAQ ||

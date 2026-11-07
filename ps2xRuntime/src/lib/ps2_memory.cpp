@@ -1111,6 +1111,30 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
+            if (std::getenv("TOL_TRACE_GSPRIV") != nullptr)
+            {
+                static uint64_t sLastPmode = ~0ULL, sLastDispfb1 = ~0ULL, sLastDisplay1 = ~0ULL;
+                static uint64_t sLastDispfb2 = ~0ULL, sLastDisplay2 = ~0ULL;
+                uint64_t *slot = nullptr;
+                const char *name = nullptr;
+                switch (regOff)
+                {
+                case 0x0000: slot = &sLastPmode; name = "PMODE"; break;
+                case 0x0070: slot = &sLastDispfb1; name = "DISPFB1"; break;
+                case 0x0080: slot = &sLastDisplay1; name = "DISPLAY1"; break;
+                case 0x0090: slot = &sLastDispfb2; name = "DISPFB2"; break;
+                case 0x00A0: slot = &sLastDisplay2; name = "DISPLAY2"; break;
+                default: break;
+                }
+                if (slot != nullptr && *slot != value)
+                {
+                    *slot = value;
+                    std::fprintf(stderr, "[gspriv] %s = 0x%016llX (fbp=%llu fbw=%llu)\n", name,
+                                 static_cast<unsigned long long>(value),
+                                 static_cast<unsigned long long>(value & 0x1FFu),
+                                 static_cast<unsigned long long>((value >> 9) & 0x3Fu));
+                }
+            }
             *reg = value;
         }
         return;
