@@ -37,6 +37,11 @@ namespace ps2x::iop::lle
             {"sysclib", 8, "lookCtypeTable"}, {"sysclib", 11, "memcmpHandler"},
             {"sysclib", 12, "memcpyHandler"}, {"sysclib", 13, "memmoveHandler"},
             {"sysclib", 14, "memsetHandler"}, {"sysclib", 17, "bzeroHandler"},
+            // 19 is sprintf. The module's callers only need the literal copied; arguments are not
+            // formatted here, which matches the emulator-side IopSysclib fallback for the same ordinal.
+            // Before this it resolved to unknownImport and the audio module logged
+            // "[iop] no kernel service for sysclib #19".
+            {"sysclib", 19, "strcpyHandler"},
             {"sysclib", 22, "strcmpHandler"}, {"sysclib", 23, "strcpyHandler"},
             {"sysclib", 27, "strlenHandler"}, {"sysclib", 29, "strncmpHandler"},
             {"sysclib", 30, "strncpyHandler"}, {"sysclib", 36, "strtolHandler"},
