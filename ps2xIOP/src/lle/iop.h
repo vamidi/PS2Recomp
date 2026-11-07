@@ -188,6 +188,8 @@ namespace ps2x::iop::lle
         void serviceEvents();
         void serviceInterrupts();
         void dmaTransfer(int channel);
+        // Writes MADR/BCR and starts CHCR for the two modelled SPU channels (libdma channels 4 and 7).
+        void startSpuDma(uint32_t channel, uint32_t address, uint32_t size, bool hasSize);
         uint32_t *dmaRegister(uint32_t physical, int &channel);
         uint32_t arg(CpuContext &c, unsigned index);
         void ret(CpuContext &c, uint32_t value) { c.gpr[2] = value; }

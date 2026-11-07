@@ -42,6 +42,11 @@ namespace ps2x::iop::lle
             // Before this it resolved to unknownImport and the audio module logged
             // "[iop] no kernel service for sysclib #19".
             {"sysclib", 19, "strcpyHandler"},
+            // dmacman: the audio modules need these to move data into SPU2. 4 reset, 5/6 env,
+            // 8/9 read back CHCR/MADR, 14 sceDmaSend, 15 sceDmaSendN.
+            {"dmacman", 4, "dmaReset"}, {"dmacman", 5, "dmaEnv"}, {"dmacman", 6, "dmaEnv"},
+            {"dmacman", 8, "dmaGetChcr"}, {"dmacman", 9, "dmaGetAddr"},
+            {"dmacman", 14, "dmaSend"}, {"dmacman", 15, "dmaSendN"},
             {"sysclib", 22, "strcmpHandler"}, {"sysclib", 23, "strcpyHandler"},
             {"sysclib", 27, "strlenHandler"}, {"sysclib", 29, "strncmpHandler"},
             {"sysclib", 30, "strncpyHandler"}, {"sysclib", 36, "strtolHandler"},
@@ -1084,6 +1089,82 @@ namespace ps2x::iop::lle
         const std::string text = readString(arg(c, 1), 65536);
         writeMemory(arg(c, 0), text.c_str(), static_cast<uint32_t>(text.size()) + 1u);
         ret(c, arg(c, 0));
+    }
+
+    // ------------------------------------------------------------------- DMA (libdma / dmacman)
+    //
+    // The audio modules (LIBSD, KORGIVAG, IXAUDIO) move data into SPU2 through libdma. Only the two
+    // channels this IOP models are served here - SPU0 (libdma channel 4) and SPU1 (channel 7) - which
+    // matches m_dma[] and dmaRegister(). Before this every dmacman import resolved to unknownImport, so
+    // no transfer was ever started, nothing reached SPU2, streams never ran to completion and the audio
+    // library never shut down.
+    namespace
+    {
+        int dmaSlotForChannel(uint32_t channel)
+        {
+            return channel == 7u ? 1 : (channel == 4u ? 0 : -1);
+        }
+    }
+
+    void Iop::startSpuDma(uint32_t channel, uint32_t address, uint32_t size, bool hasSize)
+    {
+        const int slot = dmaSlotForChannel(channel);
+        if (slot < 0)
+            return;
+        DmaChannel &dma = m_dma[static_cast<size_t>(slot)];
+        dma.madr = address & 0x001FFFFFu;
+        if (hasSize)
+        {
+            const uint32_t words = (size + 3u) >> 2u;
+            dma.bcr = (1u << 16u) | (words & 0xFFFFu); // one block of `words`
+        }
+        dma.chcr = 0x01000000u | 0x1u; // start | direction: IOP RAM -> SPU
+        static uint32_t sStarts = 0u;
+        if (++sStarts <= 16u || (sStarts % 256u) == 0u)
+        {
+            char text[128];
+            std::snprintf(text, sizeof(text), "[dma] start #%u ch=%u addr=0x%08X bcr=0x%08X auto=%d",
+                          sStarts, channel, dma.madr, dma.bcr,
+                          m_spu2.autoDmaEnabled(slot) ? 1 : 0);
+            m_ee.log(text);
+        }
+        dmaTransfer(slot);
+    }
+
+    void Iop::dmaReset(CpuContext &c)
+    {
+        if (arg(c, 0) != 0u)
+        {
+            for (DmaChannel &channel : m_dma)
+                channel = DmaChannel{};
+        }
+        ret(c, 0);
+    }
+
+    void Iop::dmaEnv(CpuContext &c) { ret(c, 0); }
+
+    void Iop::dmaGetChcr(CpuContext &c)
+    {
+        const int slot = dmaSlotForChannel(arg(c, 0));
+        ret(c, slot < 0 ? 0u : m_dma[static_cast<size_t>(slot)].chcr);
+    }
+
+    void Iop::dmaGetAddr(CpuContext &c)
+    {
+        const int slot = dmaSlotForChannel(arg(c, 0));
+        ret(c, slot < 0 ? 0u : m_dma[static_cast<size_t>(slot)].madr);
+    }
+
+    void Iop::dmaSend(CpuContext &c)
+    {
+        startSpuDma(arg(c, 0), arg(c, 1), 0u, false);
+        ret(c, 1);
+    }
+
+    void Iop::dmaSendN(CpuContext &c)
+    {
+        startSpuDma(arg(c, 0), arg(c, 1), arg(c, 2), true);
+        ret(c, 1);
     }
 
     void Iop::strncpyHandler(CpuContext &c)
